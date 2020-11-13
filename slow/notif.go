@@ -19,6 +19,7 @@ import (
 	// Load static assets
 	_ "github.com/harai/efsslow/statik"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 //go:generate statik -src=c
@@ -29,6 +30,7 @@ var (
 
 const (
 	cTaskCommLen    = 16
+	cSlowPointCount = 16
 	cDnameInlineLen = 32
 )
 
@@ -64,12 +66,14 @@ func unpackSource(name string) string {
 var source string = unpackSource("trace.c")
 
 type eventCStruct struct {
-	EvtType    uint64
-	TsMicro    uint64
-	DeltaMicro uint64
-	PID        uint64
-	Task       [cTaskCommLen]byte
-	File       [cDnameInlineLen]byte
+	EvtType          uint64
+	TsMicro          uint64
+	PointsDeltaMicro [cSlowPointCount]uint64
+	PointsCount      [cSlowPointCount]uint8
+	DeltaMicro       uint64
+	PID              uint64
+	Task             [cTaskCommLen]byte
+	File             [cDnameInlineLen]byte
 }
 
 func configNfsFileOpenTrace(m *bcc.Module) error {
@@ -116,6 +120,26 @@ func configNfs4FileOpenTrace(m *bcc.Module) error {
 	return nil
 }
 
+func addPoint(m *bcc.Module, fnName string) {
+	kprobe, err := m.LoadKprobe("enter__" + fnName)
+	if err != nil {
+		log.Fatal(fmt.Sprintf("failed to config %s trace", fnName), zap.Error(err))
+	}
+
+	if err := m.AttachKprobe(fnName, kprobe, -1); err != nil {
+		log.Fatal(fmt.Sprintf("failed to config %s trace", fnName), zap.Error(err))
+	}
+
+	kretprobe, err := m.LoadKprobe("return__" + fnName)
+	if err != nil {
+		log.Fatal(fmt.Sprintf("failed to config %s trace", fnName), zap.Error(err))
+	}
+
+	if err := m.AttachKretprobe(fnName, kretprobe, -1); err != nil {
+		log.Fatal(fmt.Sprintf("failed to config %s trace", fnName), zap.Error(err))
+	}
+}
+
 func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	if err := configNfsFileOpenTrace(m); err != nil {
 		log.Fatal("failed to config nfs_file_open trace", zap.Error(err))
@@ -124,6 +148,36 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	if err := configNfs4FileOpenTrace(m); err != nil {
 		log.Fatal("failed to config nfs4_file_open trace", zap.Error(err))
 	}
+
+	//
+	//
+	addPoint(m, "nfs4_atomic_open")
+	addPoint(m, "nfs4_get_state_owner")
+	addPoint(m, "nfs4_client_recover_expired_lease")
+	addPoint(m, "nfs4_wait_clnt_recover")
+	addPoint(m, "out_of_line_wait_on_bit")
+	addPoint(m, "nfs_put_client")
+	addPoint(m, "nfs4_schedule_state_manager")
+	addPoint(m, "nfs4_run_open_task")
+	//
+	//  nfs4_atomic_open
+	//      nfs4_do_open (N/S)
+	//          _nfs4_do_open (N/S)
+	//              nfs4_get_state_owner
+	//              nfs4_client_recover_expired_lease
+	//                  nfs4_wait_clnt_recover
+	//                      wait_on_bit_action (N/S)
+	//                          out_of_line_wait_on_bit
+	//                      nfs_put_client
+	//                  nfs4_schedule_state_manager
+	//              nfs4_opendata_alloc
+	//              _nfs4_open_and_get_state (N/S)
+	//                  _nfs4_proc_open (N/S)
+	//                      nfs4_run_open_task
+	//                          rpc_run_task
+	//                  _nfs4_opendata_to_nfs4_state
+	//
+	//
 
 	table := bcc.NewTable(m.TableId("events"), m)
 
@@ -201,12 +255,14 @@ type Event struct {
 }
 
 type eventData struct {
-	evtType    evtType
-	tsMicro    uint64
-	deltaMicro uint64
-	pid        uint32
-	comm       string
-	file       string
+	evtType          evtType
+	tsMicro          uint64
+	pointsDeltaMicro [cSlowPointCount]uint64
+	pointsCount      [cSlowPointCount]uint8
+	deltaMicro       uint64
+	pid              uint32
+	comm             string
+	file             string
 }
 
 func parseData(data []byte) (*eventData, error) {
@@ -216,12 +272,14 @@ func parseData(data []byte) (*eventData, error) {
 	}
 
 	event := &eventData{
-		evtType:    evtTypeSet.valMap[EventType(cEvent.EvtType)],
-		tsMicro:    cEvent.TsMicro,
-		deltaMicro: cEvent.DeltaMicro,
-		pid:        uint32(cEvent.PID),
-		comm:       cPointerToString(unsafe.Pointer(&cEvent.Task)),
-		file:       cPointerToString(unsafe.Pointer(&cEvent.File)),
+		evtType:          evtTypeSet.valMap[EventType(cEvent.EvtType)],
+		tsMicro:          cEvent.TsMicro,
+		pointsDeltaMicro: cEvent.PointsDeltaMicro,
+		pointsCount:      cEvent.PointsCount,
+		deltaMicro:       cEvent.DeltaMicro,
+		pid:              uint32(cEvent.PID),
+		comm:             cPointerToString(unsafe.Pointer(&cEvent.Task)),
+		file:             cPointerToString(unsafe.Pointer(&cEvent.File)),
 	}
 
 	return event, nil
@@ -261,11 +319,23 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 
 				log.Debug(
 					"event",
-					zap.String("evttype", evt.evtType.name),
-					zap.Uint32("pid", evt.pid),
-					zap.Duration("duration", time.Duration(evt.deltaMicro/1000)*time.Millisecond),
+					zap.Duration("duration", time.Duration(evt.deltaMicro)*time.Microsecond),
+					zap.Array("deltas", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+						for _, dur := range evt.pointsDeltaMicro {
+							inner.AppendDuration(time.Duration(dur) * time.Microsecond)
+						}
+						return nil
+					})),
+					zap.Array("counts", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+						for _, c := range evt.pointsCount {
+							inner.AppendUint8(c)
+						}
+						return nil
+					})),
 					zap.String("comm", evt.comm),
 					zap.String("file", evt.file),
+					zap.String("evttype", evt.evtType.name),
+					zap.Uint32("pid", evt.pid),
 				)
 
 				eventCh <- &Event{
