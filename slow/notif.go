@@ -31,6 +31,7 @@ var (
 const (
 	cTaskCommLen    = 16
 	cSlowPointCount = 16
+	cCallOrderCount = 32
 	cDnameInlineLen = 32
 )
 
@@ -70,6 +71,7 @@ type eventCStruct struct {
 	TsMicro          uint64
 	PointsDeltaMicro [cSlowPointCount]uint64
 	PointsCount      [cSlowPointCount]uint8
+	CallOrder        [cCallOrderCount]uint8
 	DeltaMicro       uint64
 	PID              uint64
 	Task             [cTaskCommLen]byte
@@ -152,13 +154,13 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//
 	//
 	addPoint(m, "nfs4_atomic_open")
-	addPoint(m, "nfs4_get_state_owner")
 	addPoint(m, "nfs4_client_recover_expired_lease")
 	addPoint(m, "nfs4_wait_clnt_recover")
-	addPoint(m, "out_of_line_wait_on_bit")
 	addPoint(m, "nfs_put_client")
-	addPoint(m, "nfs4_schedule_state_manager")
-	addPoint(m, "nfs4_run_open_task")
+	addPoint(m, "nfs_state_log_update_open_stateid")
+	addPoint(m, "_nfs4_opendata_to_nfs4_state")
+	addPoint(m, "update_open_stateid")
+	addPoint(m, "update_open_stateflags")
 	//
 	//  nfs4_atomic_open
 	//      nfs4_do_open (N/S)
@@ -167,15 +169,36 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//              nfs4_client_recover_expired_lease
 	//                  nfs4_wait_clnt_recover
 	//                      wait_on_bit_action (N/S)
-	//                          out_of_line_wait_on_bit
+	//                          out_of_line_wait_on_bit (MULTIPLE CALLS)
 	//                      nfs_put_client
-	//                  nfs4_schedule_state_manager
+	//                  nfs4_schedule_state_manager (MULTIPLE CALLS)
 	//              nfs4_opendata_alloc
 	//              _nfs4_open_and_get_state (N/S)
 	//                  _nfs4_proc_open (N/S)
 	//                      nfs4_run_open_task
 	//                          rpc_run_task
+	//                          rpc_wait_for_completion_task (N/S)
+	//                              __rpc_wait_for_completion_task
+	//                      nfs_fattr_map_and_free_names
+	//                      update_changeattr (Conditional)
+	//                      _nfs4_proc_open_confirm (Conditional)
+	//                      nfs4_proc_getattr (Conditional)
 	//                  _nfs4_opendata_to_nfs4_state
+	//                      nfs4_opendata_find_nfs4_state (N/S)
+	//                          nfs4_opendata_get_inode (N/S)
+	//                      nfs4_opendata_check_deleg (N/S)
+	//                          nfs_inode_set_delegation (Conditional)
+	//                          nfs_inode_reclaim_delegation (Conditional)
+	//                      update_open_stateid
+	//                          nfs_state_set_open_stateid (N/S)
+	//                              nfs_set_open_stateid_locked (N/S)
+	//                                  nfs_state_log_update_open_stateid
+	//                          nfs_mark_delegation_referenced (Conditional)
+	//                          update_open_stateflags
+	//                      nfs_release_seqid
+	//                  pnfs_parse_lgopen
+	//                  nfs4_opendata_access (N/S)
+	//                  nfs_inode_attach_open_context (Conditional)
 	//
 	//
 
@@ -259,6 +282,7 @@ type eventData struct {
 	tsMicro          uint64
 	pointsDeltaMicro [cSlowPointCount]uint64
 	pointsCount      [cSlowPointCount]uint8
+	callOrder        [cCallOrderCount]uint8
 	deltaMicro       uint64
 	pid              uint32
 	comm             string
@@ -276,6 +300,7 @@ func parseData(data []byte) (*eventData, error) {
 		tsMicro:          cEvent.TsMicro,
 		pointsDeltaMicro: cEvent.PointsDeltaMicro,
 		pointsCount:      cEvent.PointsCount,
+		callOrder:        cEvent.CallOrder,
 		deltaMicro:       cEvent.DeltaMicro,
 		pid:              uint32(cEvent.PID),
 		comm:             cPointerToString(unsafe.Pointer(&cEvent.Task)),
@@ -329,6 +354,12 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 					zap.Array("counts", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
 						for _, c := range evt.pointsCount {
 							inner.AppendUint8(c)
+						}
+						return nil
+					})),
+					zap.Array("order", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+						for _, p := range evt.callOrder {
+							inner.AppendUint8(p)
 						}
 						return nil
 					})),
