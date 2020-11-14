@@ -157,9 +157,9 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	addPoint(m, "nfs4_client_recover_expired_lease")
 	addPoint(m, "nfs4_wait_clnt_recover")
 	addPoint(m, "nfs_put_client")
-	addPoint(m, "nfs_state_log_update_open_stateid")
-	addPoint(m, "_nfs4_opendata_to_nfs4_state")
 	addPoint(m, "update_open_stateid")
+	addPoint(m, "prepare_to_wait")
+	addPoint(m, "nfs_state_log_update_open_stateid")
 	addPoint(m, "update_open_stateflags")
 	//
 	//  nfs4_atomic_open
@@ -192,6 +192,8 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//                      update_open_stateid
 	//                          nfs_state_set_open_stateid (N/S)
 	//                              nfs_set_open_stateid_locked (N/S)
+	//                                  prepare_to_wait
+	//                                  nfs_test_and_clear_all_open_stateid (N/S)
 	//                                  nfs_state_log_update_open_stateid
 	//                          nfs_mark_delegation_referenced (Conditional)
 	//                          update_open_stateflags

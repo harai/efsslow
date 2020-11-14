@@ -140,18 +140,18 @@ int return__nfs4_wait_clnt_recover(struct pt_regs *ctx) { return check(ctx, 5); 
 int return__nfs4_client_recover_expired_lease(struct pt_regs *ctx) {
   return check(ctx, 6);
 }
-int enter___nfs4_opendata_to_nfs4_state(struct pt_regs *ctx) { return check(ctx, 7); }
-int enter__update_open_stateid(struct pt_regs *ctx) { return check(ctx, 8); }
+int enter__update_open_stateid(struct pt_regs *ctx) { return check(ctx, 7); }
 // DELAY
+int enter__prepare_to_wait(struct pt_regs *ctx) { return check(ctx, 8); }
+int return__prepare_to_wait(struct pt_regs *ctx) { return check(ctx, 9); }
 int enter__nfs_state_log_update_open_stateid(struct pt_regs *ctx) {
-  return check(ctx, 9);
-}
-int return__nfs_state_log_update_open_stateid(struct pt_regs *ctx) {
   return check(ctx, 10);
 }
+int return__nfs_state_log_update_open_stateid(struct pt_regs *ctx) {
+  return check(ctx, 11);
+}
 // DELAY
-int enter__update_open_stateflags(struct pt_regs *ctx) { return check(ctx, 11); }
-int return__update_open_stateflags(struct pt_regs *ctx) { return check(ctx, 12); }
-int return__update_open_stateid(struct pt_regs *ctx) { return check(ctx, 13); }
-int return___nfs4_opendata_to_nfs4_state(struct pt_regs *ctx) { return check(ctx, 14); }
+int enter__update_open_stateflags(struct pt_regs *ctx) { return check(ctx, 12); }
+int return__update_open_stateflags(struct pt_regs *ctx) { return check(ctx, 13); }
+int return__update_open_stateid(struct pt_regs *ctx) { return check(ctx, 14); }
 int return__nfs4_atomic_open(struct pt_regs *ctx) { return check(ctx, 15); }
