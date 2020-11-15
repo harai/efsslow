@@ -193,14 +193,6 @@ func generateSource(config *Config) string {
 		strconv.FormatUint(uint64(config.SlowThresholdMS), 10), -1)
 }
 
-// Event tells the details of notification.
-type Event struct {
-	Pid           uint32
-	DurationMicro uint64
-	Comm          string
-	File          string
-}
-
 type eventData struct {
 	tsMicro          uint64
 	pointsDeltaMicro [cSlowPointCount]uint64
@@ -233,7 +225,7 @@ func parseData(data []byte) (*eventData, error) {
 }
 
 // Run starts compiling eBPF code and then notifying of file updates.
-func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
+func Run(ctx context.Context, config *Config) {
 	log = config.Log
 	source := generateSource(config)
 	if config.Debug {
@@ -243,7 +235,6 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 	defer m.Close()
 
 	if config.Quit {
-		close(eventCh)
 		return
 	}
 
@@ -255,7 +246,6 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 		for {
 			select {
 			case <-ctx.Done():
-				close(eventCh)
 				return
 			case data := <-channel:
 				evt, err := parseData(data)
@@ -289,13 +279,6 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 					zap.String("file", evt.file),
 					zap.Uint32("pid", evt.pid),
 				)
-
-				eventCh <- &Event{
-					Pid:           evt.pid,
-					DurationMicro: evt.deltaMicro,
-					Comm:          evt.comm,
-					File:          evt.file,
-				}
 			}
 		}
 	}()
