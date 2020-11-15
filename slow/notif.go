@@ -145,7 +145,7 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//              nfs4_client_recover_expired_lease
 	//                  nfs4_wait_clnt_recover
 	//                      wait_on_bit_action (N/S)
-	//                          out_of_line_wait_on_bit
+	//                          out_of_line_wait_on_bit (Conditional)
 	//                              __wait_on_bit
 	//                                  prepare_to_wait
 	//                                  nfs_wait_bit_killable (Callback) <== This function call could be slow (result/)
@@ -173,8 +173,8 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//                          nfs_state_set_open_stateid (N/S)
 	//                              nfs_set_open_stateid_locked (N/S)
 	//                                  prepare_to_wait
-	//                                  nfs_test_and_clear_all_open_stateid (N/S)
-	//                                  nfs_state_log_update_open_stateid
+	//                                  finish_wait
+	//                                  nfs_state_log_update_open_stateid (Conditional)
 	//                          nfs_mark_delegation_referenced (Conditional)
 	//                          update_open_stateflags
 	//                      nfs_release_seqid
