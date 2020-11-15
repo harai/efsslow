@@ -61,7 +61,6 @@ func main() {
 			Log:             log,
 		}
 
-		eventCh := make(chan *slow.Event)
 		ctx, cancel := context.WithCancel(context.Background())
 
 		sig := make(chan os.Signal)
@@ -71,15 +70,7 @@ func main() {
 			cancel()
 		}()
 
-		go func() {
-			for {
-				if _, ok := <-eventCh; !ok {
-					return
-				}
-			}
-		}()
-
-		slow.Run(ctx, cfg, eventCh)
+		slow.Run(ctx, cfg)
 
 		return nil
 	}

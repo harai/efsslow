@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unsafe"
 
 	"github.com/iovisor/gobpf/bcc"
@@ -30,8 +29,8 @@ var (
 
 const (
 	cTaskCommLen    = 16
-	cSlowPointCount = 16
-	cCallOrderCount = 32
+	cSlowPointCount = 32
+	cCallOrderCount = 128
 	cDnameInlineLen = 32
 )
 
@@ -67,41 +66,19 @@ func unpackSource(name string) string {
 var source string = unpackSource("trace.c")
 
 type eventCStruct struct {
-	EvtType          uint64
-	TsMicro          uint64
-	PointsDeltaMicro [cSlowPointCount]uint64
-	PointsCount      [cSlowPointCount]uint8
-	CallOrder        [cCallOrderCount]uint8
-	DeltaMicro       uint64
-	PID              uint64
-	Task             [cTaskCommLen]byte
-	File             [cDnameInlineLen]byte
-}
-
-func configNfsFileOpenTrace(m *bcc.Module) error {
-	kprobe, err := m.LoadKprobe("enter__nfs_file_open")
-	if err != nil {
-		return err
-	}
-
-	if err := m.AttachKprobe("nfs_file_open", kprobe, -1); err != nil {
-		return err
-	}
-
-	kretprobe, err := m.LoadKprobe("return__nfs_file_open")
-	if err != nil {
-		return err
-	}
-
-	if err := m.AttachKretprobe("nfs_file_open", kretprobe, -1); err != nil {
-		return err
-	}
-
-	return nil
+	Ts          uint64
+	PointIDs    [cCallOrderCount]uint8
+	PointDeltas [cCallOrderCount]uint32
+	CallCounts  [cSlowPointCount]uint8
+	Task        [cTaskCommLen]byte
+	File        [cDnameInlineLen]byte
+	PID         uint64
+	Delta       uint64
+	OrderIndex  uint64
 }
 
 func configNfs4FileOpenTrace(m *bcc.Module) error {
-	kprobe, err := m.LoadKprobe("enter__nfs_file_open")
+	kprobe, err := m.LoadKprobe("enter__nfs4_file_open")
 	if err != nil {
 		return err
 	}
@@ -143,10 +120,6 @@ func addPoint(m *bcc.Module, fnName string) {
 }
 
 func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
-	if err := configNfsFileOpenTrace(m); err != nil {
-		log.Fatal("failed to config nfs_file_open trace", zap.Error(err))
-	}
-
 	if err := configNfs4FileOpenTrace(m); err != nil {
 		log.Fatal("failed to config nfs4_file_open trace", zap.Error(err))
 	}
@@ -159,8 +132,11 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	addPoint(m, "nfs_put_client")
 	addPoint(m, "update_open_stateid")
 	addPoint(m, "prepare_to_wait")
+	addPoint(m, "finish_wait")
 	addPoint(m, "nfs_state_log_update_open_stateid")
 	addPoint(m, "update_open_stateflags")
+
+	addPoint(m, "nfs_wait_bit_killable")
 	//
 	//  nfs4_atomic_open
 	//      nfs4_do_open (N/S)
@@ -169,9 +145,13 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//              nfs4_client_recover_expired_lease
 	//                  nfs4_wait_clnt_recover
 	//                      wait_on_bit_action (N/S)
-	//                          out_of_line_wait_on_bit (MULTIPLE CALLS)
+	//                          out_of_line_wait_on_bit (Conditional)
+	//                              __wait_on_bit
+	//                                  prepare_to_wait
+	//                                  nfs_wait_bit_killable (Callback) <== This function call could be slow (result/)
+	//                                  finish_wait
 	//                      nfs_put_client
-	//                  nfs4_schedule_state_manager (MULTIPLE CALLS)
+	//                  nfs4_schedule_state_manager
 	//              nfs4_opendata_alloc
 	//              _nfs4_open_and_get_state (N/S)
 	//                  _nfs4_proc_open (N/S)
@@ -193,8 +173,8 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//                          nfs_state_set_open_stateid (N/S)
 	//                              nfs_set_open_stateid_locked (N/S)
 	//                                  prepare_to_wait
-	//                                  nfs_test_and_clear_all_open_stateid (N/S)
-	//                                  nfs_state_log_update_open_stateid
+	//                                  finish_wait
+	//                                  nfs_state_log_update_open_stateid (Conditional)
 	//                          nfs_mark_delegation_referenced (Conditional)
 	//                          update_open_stateflags
 	//                      nfs_release_seqid
@@ -214,55 +194,6 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	return perfMap
 }
 
-type evtType struct {
-	val  EventType
-	name string
-}
-
-type evtTypeData struct {
-	valMap   map[EventType]evtType
-	evtTypes []evtType
-}
-
-// EventType is an event type eBPF notfies.
-type EventType uint64
-
-// Event type to be notified.
-const (
-	EventTypeNfs4FileOpen EventType = 0x1 << iota
-	EventTypeNfsFileOpen
-)
-
-func newEvtTypeSet() evtTypeData {
-	evtTypes := []evtType{
-		{EventTypeNfs4FileOpen, "nfs4_file_open"},
-		{EventTypeNfsFileOpen, "nfs4_file_open"},
-	}
-
-	s := evtTypeData{
-		valMap:   make(map[EventType]evtType, len(evtTypes)),
-		evtTypes: make([]evtType, 0, len(evtTypes)),
-	}
-
-	for _, e := range evtTypes {
-		s.valMap[e.val] = e
-		s.evtTypes = append(s.evtTypes, e)
-	}
-
-	return s
-}
-
-var evtTypeSet = newEvtTypeSet()
-
-func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] > unicode.MaxASCII {
-			return false
-		}
-	}
-	return true
-}
-
 func generateSource(config *Config) string {
 	return strings.Replace(
 		source,
@@ -270,25 +201,20 @@ func generateSource(config *Config) string {
 		strconv.FormatUint(uint64(config.SlowThresholdMS), 10), -1)
 }
 
-// Event tells the details of notification.
-type Event struct {
-	EvtType       EventType
-	Pid           uint32
-	DurationMicro uint64
-	Comm          string
-	File          string
+type eventPointData struct {
+	id    uint32
+	delta uint32
 }
 
 type eventData struct {
-	evtType          evtType
-	tsMicro          uint64
-	pointsDeltaMicro [cSlowPointCount]uint64
-	pointsCount      [cSlowPointCount]uint8
-	callOrder        [cCallOrderCount]uint8
-	deltaMicro       uint64
-	pid              uint32
-	comm             string
-	file             string
+	ts          uint64
+	delta       uint32
+	pointIDs    [cCallOrderCount]uint8
+	pointDeltas [cCallOrderCount]uint32
+	callCounts  [cSlowPointCount]uint8
+	pid         uint32
+	task        string
+	file        string
 }
 
 func parseData(data []byte) (*eventData, error) {
@@ -298,22 +224,21 @@ func parseData(data []byte) (*eventData, error) {
 	}
 
 	event := &eventData{
-		evtType:          evtTypeSet.valMap[EventType(cEvent.EvtType)],
-		tsMicro:          cEvent.TsMicro,
-		pointsDeltaMicro: cEvent.PointsDeltaMicro,
-		pointsCount:      cEvent.PointsCount,
-		callOrder:        cEvent.CallOrder,
-		deltaMicro:       cEvent.DeltaMicro,
-		pid:              uint32(cEvent.PID),
-		comm:             cPointerToString(unsafe.Pointer(&cEvent.Task)),
-		file:             cPointerToString(unsafe.Pointer(&cEvent.File)),
+		ts:          cEvent.Ts,
+		delta:       uint32(cEvent.Delta),
+		pointIDs:    cEvent.PointIDs,
+		pointDeltas: cEvent.PointDeltas,
+		callCounts:  cEvent.CallCounts,
+		pid:         uint32(cEvent.PID),
+		task:        cPointerToString(unsafe.Pointer(&cEvent.Task)),
+		file:        cPointerToString(unsafe.Pointer(&cEvent.File)),
 	}
 
 	return event, nil
 }
 
 // Run starts compiling eBPF code and then notifying of file updates.
-func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
+func Run(ctx context.Context, config *Config) {
 	log = config.Log
 	source := generateSource(config)
 	if config.Debug {
@@ -323,7 +248,6 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 	defer m.Close()
 
 	if config.Quit {
-		close(eventCh)
 		return
 	}
 
@@ -335,7 +259,6 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 		for {
 			select {
 			case <-ctx.Done():
-				close(eventCh)
 				return
 			case data := <-channel:
 				evt, err := parseData(data)
@@ -346,38 +269,28 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 
 				log.Debug(
 					"event",
-					zap.Duration("duration", time.Duration(evt.deltaMicro)*time.Microsecond),
-					zap.Array("deltas", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
-						for _, dur := range evt.pointsDeltaMicro {
-							inner.AppendDuration(time.Duration(dur) * time.Microsecond)
+					zap.Duration("delta", time.Duration(evt.delta)*time.Microsecond),
+					zap.Array("points", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+						for i, id := range evt.pointIDs {
+							inner.AppendObject(zapcore.ObjectMarshalerFunc(func(inner2 zapcore.ObjectEncoder) error {
+								inner2.AddUint8("id", id)
+								inner2.AddDuration("delta", time.Duration(evt.pointDeltas[i])*time.Microsecond)
+								inner2.AddUint8("total", evt.callCounts[id])
+								return nil
+							}))
 						}
 						return nil
 					})),
 					zap.Array("counts", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
-						for _, c := range evt.pointsCount {
+						for _, c := range evt.callCounts {
 							inner.AppendUint8(c)
 						}
 						return nil
 					})),
-					zap.Array("order", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
-						for _, p := range evt.callOrder {
-							inner.AppendUint8(p)
-						}
-						return nil
-					})),
-					zap.String("comm", evt.comm),
-					zap.String("file", evt.file),
-					zap.String("evttype", evt.evtType.name),
 					zap.Uint32("pid", evt.pid),
+					zap.String("task", evt.task),
+					zap.String("file", evt.file),
 				)
-
-				eventCh <- &Event{
-					EvtType:       evt.evtType.val,
-					Pid:           evt.pid,
-					DurationMicro: evt.deltaMicro,
-					Comm:          evt.comm,
-					File:          evt.file,
-				}
 			}
 		}
 	}()
