@@ -17,11 +17,11 @@ struct val_t {
 };
 
 struct data_t {
-  u64 ts_us;
-  u64 points_delta_us[SLOW_POINT_COUNT];
+  u64 ts;
+  u64 points_delta[SLOW_POINT_COUNT];
   u8 points_count[SLOW_POINT_COUNT];
   u8 call_order[CALL_ORDER_COUNT];
-  u64 delta_us;
+  u64 delta;
   u64 pid;
   char task[TASK_COMM_LEN];
   char file[DNAME_INLINE_LEN];
@@ -62,16 +62,16 @@ int return__nfs4_file_open(struct pt_regs *ctx) {
   u32 pid = id >> 32;
 
   u64 ts = bpf_ktime_get_ns();
-  u64 delta_us = (ts - valp->ts) / 1000;
-  if (delta_us < SLOW_THRESHOLD_MS * 1000) {
+  u64 delta = (ts - valp->ts) / 1000;
+  if (delta < SLOW_THRESHOLD_MS * 1000) {
     return 0;
   }
 
-  struct data_t data = {.delta_us = delta_us, .pid = pid};
+  struct data_t data = {.delta = delta, .pid = pid};
 
 #pragma unroll
   for (int i = 0; i < SLOW_POINT_COUNT; i++) {
-    data.points_delta_us[i] = valp->points_delta[i];
+    data.points_delta[i] = valp->points_delta[i];
     data.points_count[i] = valp->points_count[i];
   }
 
@@ -80,7 +80,7 @@ int return__nfs4_file_open(struct pt_regs *ctx) {
     data.call_order[i] = valp->call_order[i];
   }
 
-  data.ts_us = ts / 1000;
+  data.ts = ts / 1000;
   bpf_get_current_comm(&data.task, sizeof(data.task));
 
   // workaround (rewriter should handle file to d_name in one step):

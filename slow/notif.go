@@ -66,14 +66,14 @@ func unpackSource(name string) string {
 var source string = unpackSource("trace.c")
 
 type eventCStruct struct {
-	TsMicro          uint64
-	PointsDeltaMicro [cSlowPointCount]uint64
-	PointsCount      [cSlowPointCount]uint8
-	CallOrder        [cCallOrderCount]uint8
-	DeltaMicro       uint64
-	PID              uint64
-	Task             [cTaskCommLen]byte
-	File             [cDnameInlineLen]byte
+	Ts          uint64
+	PointsDelta [cSlowPointCount]uint64
+	PointsCount [cSlowPointCount]uint8
+	CallOrder   [cCallOrderCount]uint8
+	Delta       uint64
+	PID         uint64
+	Task        [cTaskCommLen]byte
+	File        [cDnameInlineLen]byte
 }
 
 func configNfs4FileOpenTrace(m *bcc.Module) error {
@@ -194,14 +194,14 @@ func generateSource(config *Config) string {
 }
 
 type eventData struct {
-	tsMicro          uint64
-	pointsDeltaMicro [cSlowPointCount]uint64
-	pointsCount      [cSlowPointCount]uint8
-	callOrder        [cCallOrderCount]uint8
-	deltaMicro       uint64
-	pid              uint32
-	comm             string
-	file             string
+	ts          uint64
+	pointsDelta [cSlowPointCount]uint64
+	pointsCount [cSlowPointCount]uint8
+	callOrder   [cCallOrderCount]uint8
+	delta       uint64
+	pid         uint32
+	comm        string
+	file        string
 }
 
 func parseData(data []byte) (*eventData, error) {
@@ -211,14 +211,14 @@ func parseData(data []byte) (*eventData, error) {
 	}
 
 	event := &eventData{
-		tsMicro:          cEvent.TsMicro,
-		pointsDeltaMicro: cEvent.PointsDeltaMicro,
-		pointsCount:      cEvent.PointsCount,
-		callOrder:        cEvent.CallOrder,
-		deltaMicro:       cEvent.DeltaMicro,
-		pid:              uint32(cEvent.PID),
-		comm:             cPointerToString(unsafe.Pointer(&cEvent.Task)),
-		file:             cPointerToString(unsafe.Pointer(&cEvent.File)),
+		ts:          cEvent.Ts,
+		pointsDelta: cEvent.PointsDelta,
+		pointsCount: cEvent.PointsCount,
+		callOrder:   cEvent.CallOrder,
+		delta:       cEvent.Delta,
+		pid:         uint32(cEvent.PID),
+		comm:        cPointerToString(unsafe.Pointer(&cEvent.Task)),
+		file:        cPointerToString(unsafe.Pointer(&cEvent.File)),
 	}
 
 	return event, nil
@@ -256,9 +256,9 @@ func Run(ctx context.Context, config *Config) {
 
 				log.Debug(
 					"event",
-					zap.Duration("duration", time.Duration(evt.deltaMicro)*time.Microsecond),
+					zap.Duration("duration", time.Duration(evt.delta)*time.Microsecond),
 					zap.Array("deltas", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
-						for _, dur := range evt.pointsDeltaMicro {
+						for _, dur := range evt.pointsDelta {
 							inner.AppendDuration(time.Duration(dur) * time.Microsecond)
 						}
 						return nil
