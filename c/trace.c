@@ -13,7 +13,7 @@ struct val_t {
   u8 points_count[SLOW_POINT_COUNT];
   u8 call_order[CALL_ORDER_COUNT];
   u64 order_index;
-  struct file *fp;
+  char file[DNAME_INLINE_LEN];
 };
 
 struct data_t {
@@ -33,7 +33,9 @@ BPF_PERF_OUTPUT(events);
 int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
   u64 id = bpf_get_current_pid_tgid();
 
-  struct val_t val = {.fp = filp, .call_order = 0, .ts = bpf_ktime_get_ns()};
+  struct val_t val = {.call_order = 0, .ts = bpf_ktime_get_ns()};
+
+  bpf_probe_read_kernel(val.file, DNAME_INLINE_LEN, filp->f_path.dentry->d_iname);
 
 #pragma unroll
   for (int i = 0; i < SLOW_POINT_COUNT; i++) {
@@ -80,19 +82,12 @@ int return__nfs4_file_open(struct pt_regs *ctx) {
     data.call_order[i] = valp->call_order[i];
   }
 
-  data.ts = ts / 1000;
-  bpf_get_current_comm(&data.task, sizeof(data.task));
+#pragma unroll
+  for (int i = 0; i < DNAME_INLINE_LEN; i++) {
+    data.file[i] = valp->file[i];
+  }
 
-  // workaround (rewriter should handle file to d_name in one step):
-  struct dentry *de = NULL;
-  struct qstr qs = {};
-  bpf_probe_read_kernel(&de, sizeof(de), &valp->fp->f_path.dentry);
-
-  bpf_probe_read_kernel(&qs, sizeof(qs), (void *)&de->d_name);
-  if (qs.len == 0)
-    return 0;
-
-  bpf_probe_read_kernel(&data.file, sizeof(data.file), (void *)qs.name);
+  bpf_get_current_comm(data.task, sizeof(val.task));
 
   events.perf_submit(ctx, &data, sizeof(data));
   return 0;
