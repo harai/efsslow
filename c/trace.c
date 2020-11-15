@@ -13,14 +13,6 @@ struct val_t {
   u8 points_count[SLOW_POINT_COUNT];
   u8 call_order[CALL_ORDER_COUNT];
   u64 order_index;
-  char file[DNAME_INLINE_LEN];
-};
-
-struct data_t {
-  u64 ts;
-  u64 points_delta[SLOW_POINT_COUNT];
-  u8 points_count[SLOW_POINT_COUNT];
-  u8 call_order[CALL_ORDER_COUNT];
   u64 delta;
   u64 pid;
   char task[TASK_COMM_LEN];
@@ -33,7 +25,7 @@ BPF_PERF_OUTPUT(events);
 int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
   u64 id = bpf_get_current_pid_tgid();
 
-  struct val_t val = {.call_order = 0, .ts = bpf_ktime_get_ns()};
+  struct val_t val = {.call_order = 0, .ts = bpf_ktime_get_ns() / 1000};
 
   bpf_probe_read_kernel(val.file, DNAME_INLINE_LEN, filp->f_path.dentry->d_iname);
 
@@ -61,35 +53,17 @@ int return__nfs4_file_open(struct pt_regs *ctx) {
   }
   entryinfo.delete(&id);
 
-  u32 pid = id >> 32;
-
-  u64 ts = bpf_ktime_get_ns();
-  u64 delta = (ts - valp->ts) / 1000;
+  u64 delta = bpf_ktime_get_ns() / 1000 - valp->ts;
   if (delta < SLOW_THRESHOLD_MS * 1000) {
     return 0;
   }
 
-  struct data_t data = {.delta = delta, .pid = pid};
+  valp->delta = delta;
+  valp->pid = id >> 32;
 
-#pragma unroll
-  for (int i = 0; i < SLOW_POINT_COUNT; i++) {
-    data.points_delta[i] = valp->points_delta[i];
-    data.points_count[i] = valp->points_count[i];
-  }
+  bpf_get_current_comm(valp->task, sizeof(valp->task));
 
-#pragma unroll
-  for (int i = 0; i < CALL_ORDER_COUNT; i++) {
-    data.call_order[i] = valp->call_order[i];
-  }
-
-#pragma unroll
-  for (int i = 0; i < DNAME_INLINE_LEN; i++) {
-    data.file[i] = valp->file[i];
-  }
-
-  bpf_get_current_comm(data.task, sizeof(val.task));
-
-  events.perf_submit(ctx, &data, sizeof(data));
+  events.perf_submit(ctx, valp, sizeof(struct val_t));
   return 0;
 }
 
@@ -100,8 +74,7 @@ static int check(struct pt_regs *ctx, u8 point) {
     return 0;
   }
 
-  u64 ts = bpf_ktime_get_ns();
-  valp->points_delta[point] = (ts - valp->ts) / 1000;
+  valp->points_delta[point] = bpf_ktime_get_ns() / 1000 - valp->ts;
   valp->points_count[point] += 1;
 
   valp->call_order[valp->order_index++ & (CALL_ORDER_COUNT - 1)] = point;

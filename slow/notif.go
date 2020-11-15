@@ -70,6 +70,7 @@ type eventCStruct struct {
 	PointsDelta [cSlowPointCount]uint64
 	PointsCount [cSlowPointCount]uint8
 	CallOrder   [cCallOrderCount]uint8
+	OrderIndex  uint64
 	Delta       uint64
 	PID         uint64
 	Task        [cTaskCommLen]byte
