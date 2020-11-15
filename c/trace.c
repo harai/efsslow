@@ -7,9 +7,6 @@
 #define SLOW_POINT_COUNT 16
 #define CALL_ORDER_COUNT 32
 
-#define SLOW_EVENT_NFS4_FILE_OPEN 0x1
-#define SLOW_EVENT_NFS_FILE_OPEN 0x2
-
 struct val_t {
   u64 ts;
   u64 points_delta[SLOW_POINT_COUNT];
@@ -20,7 +17,6 @@ struct val_t {
 };
 
 struct data_t {
-  u64 type;
   u64 ts_us;
   u64 points_delta_us[SLOW_POINT_COUNT];
   u8 points_count[SLOW_POINT_COUNT];
@@ -34,7 +30,7 @@ struct data_t {
 BPF_HASH(entryinfo, u64, struct val_t);
 BPF_PERF_OUTPUT(events);
 
-int enter__nfs_file_open(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
+int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
   u64 id = bpf_get_current_pid_tgid();
 
   struct val_t val = {.fp = filp, .call_order = 0, .ts = bpf_ktime_get_ns()};
@@ -55,7 +51,7 @@ int enter__nfs_file_open(struct pt_regs *ctx, struct inode *inode, struct file *
   return 0;
 }
 
-static int trace_exit(struct pt_regs *ctx, u64 type) {
+int return__nfs4_file_open(struct pt_regs *ctx) {
   u64 id = bpf_get_current_pid_tgid();
   struct val_t *valp = entryinfo.lookup(&id);
   if (valp == 0) {
@@ -71,7 +67,7 @@ static int trace_exit(struct pt_regs *ctx, u64 type) {
     return 0;
   }
 
-  struct data_t data = {.type = type, .delta_us = delta_us, .pid = pid};
+  struct data_t data = {.delta_us = delta_us, .pid = pid};
 
 #pragma unroll
   for (int i = 0; i < SLOW_POINT_COUNT; i++) {
@@ -117,14 +113,6 @@ static int check(struct pt_regs *ctx, u8 point) {
 
   entryinfo.update(&id, valp);
   return 0;
-}
-
-int return__nfs4_file_open(struct pt_regs *ctx) {
-  return trace_exit(ctx, SLOW_EVENT_NFS4_FILE_OPEN);
-}
-
-int return__nfs_file_open(struct pt_regs *ctx) {
-  return trace_exit(ctx, SLOW_EVENT_NFS_FILE_OPEN);
 }
 
 int enter__nfs4_atomic_open(struct pt_regs *ctx) { return check(ctx, 0); }

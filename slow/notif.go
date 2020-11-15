@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 	"unsafe"
 
 	"github.com/iovisor/gobpf/bcc"
@@ -67,7 +66,6 @@ func unpackSource(name string) string {
 var source string = unpackSource("trace.c")
 
 type eventCStruct struct {
-	EvtType          uint64
 	TsMicro          uint64
 	PointsDeltaMicro [cSlowPointCount]uint64
 	PointsCount      [cSlowPointCount]uint8
@@ -78,30 +76,8 @@ type eventCStruct struct {
 	File             [cDnameInlineLen]byte
 }
 
-func configNfsFileOpenTrace(m *bcc.Module) error {
-	kprobe, err := m.LoadKprobe("enter__nfs_file_open")
-	if err != nil {
-		return err
-	}
-
-	if err := m.AttachKprobe("nfs_file_open", kprobe, -1); err != nil {
-		return err
-	}
-
-	kretprobe, err := m.LoadKprobe("return__nfs_file_open")
-	if err != nil {
-		return err
-	}
-
-	if err := m.AttachKretprobe("nfs_file_open", kretprobe, -1); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func configNfs4FileOpenTrace(m *bcc.Module) error {
-	kprobe, err := m.LoadKprobe("enter__nfs_file_open")
+	kprobe, err := m.LoadKprobe("enter__nfs4_file_open")
 	if err != nil {
 		return err
 	}
@@ -143,10 +119,6 @@ func addPoint(m *bcc.Module, fnName string) {
 }
 
 func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
-	if err := configNfsFileOpenTrace(m); err != nil {
-		log.Fatal("failed to config nfs_file_open trace", zap.Error(err))
-	}
-
 	if err := configNfs4FileOpenTrace(m); err != nil {
 		log.Fatal("failed to config nfs4_file_open trace", zap.Error(err))
 	}
@@ -214,55 +186,6 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	return perfMap
 }
 
-type evtType struct {
-	val  EventType
-	name string
-}
-
-type evtTypeData struct {
-	valMap   map[EventType]evtType
-	evtTypes []evtType
-}
-
-// EventType is an event type eBPF notfies.
-type EventType uint64
-
-// Event type to be notified.
-const (
-	EventTypeNfs4FileOpen EventType = 0x1 << iota
-	EventTypeNfsFileOpen
-)
-
-func newEvtTypeSet() evtTypeData {
-	evtTypes := []evtType{
-		{EventTypeNfs4FileOpen, "nfs4_file_open"},
-		{EventTypeNfsFileOpen, "nfs4_file_open"},
-	}
-
-	s := evtTypeData{
-		valMap:   make(map[EventType]evtType, len(evtTypes)),
-		evtTypes: make([]evtType, 0, len(evtTypes)),
-	}
-
-	for _, e := range evtTypes {
-		s.valMap[e.val] = e
-		s.evtTypes = append(s.evtTypes, e)
-	}
-
-	return s
-}
-
-var evtTypeSet = newEvtTypeSet()
-
-func isASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] > unicode.MaxASCII {
-			return false
-		}
-	}
-	return true
-}
-
 func generateSource(config *Config) string {
 	return strings.Replace(
 		source,
@@ -272,7 +195,6 @@ func generateSource(config *Config) string {
 
 // Event tells the details of notification.
 type Event struct {
-	EvtType       EventType
 	Pid           uint32
 	DurationMicro uint64
 	Comm          string
@@ -280,7 +202,6 @@ type Event struct {
 }
 
 type eventData struct {
-	evtType          evtType
 	tsMicro          uint64
 	pointsDeltaMicro [cSlowPointCount]uint64
 	pointsCount      [cSlowPointCount]uint8
@@ -298,7 +219,6 @@ func parseData(data []byte) (*eventData, error) {
 	}
 
 	event := &eventData{
-		evtType:          evtTypeSet.valMap[EventType(cEvent.EvtType)],
 		tsMicro:          cEvent.TsMicro,
 		pointsDeltaMicro: cEvent.PointsDeltaMicro,
 		pointsCount:      cEvent.PointsCount,
@@ -367,12 +287,10 @@ func Run(ctx context.Context, config *Config, eventCh chan<- *Event) {
 					})),
 					zap.String("comm", evt.comm),
 					zap.String("file", evt.file),
-					zap.String("evttype", evt.evtType.name),
 					zap.Uint32("pid", evt.pid),
 				)
 
 				eventCh <- &Event{
-					EvtType:       evt.evtType.val,
 					Pid:           evt.pid,
 					DurationMicro: evt.deltaMicro,
 					Comm:          evt.comm,
