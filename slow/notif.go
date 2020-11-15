@@ -29,8 +29,8 @@ var (
 
 const (
 	cTaskCommLen    = 16
-	cSlowPointCount = 16
-	cCallOrderCount = 32
+	cSlowPointCount = 32
+	cCallOrderCount = 128
 	cDnameInlineLen = 32
 )
 
@@ -67,14 +67,14 @@ var source string = unpackSource("trace.c")
 
 type eventCStruct struct {
 	Ts          uint64
-	PointsDelta [cSlowPointCount]uint64
-	PointsCount [cSlowPointCount]uint8
-	CallOrder   [cCallOrderCount]uint8
-	OrderIndex  uint64
-	Delta       uint64
-	PID         uint64
+	PointIDs    [cCallOrderCount]uint8
+	PointDeltas [cCallOrderCount]uint32
+	CallCounts  [cSlowPointCount]uint8
 	Task        [cTaskCommLen]byte
 	File        [cDnameInlineLen]byte
+	PID         uint64
+	Delta       uint64
+	OrderIndex  uint64
 }
 
 func configNfs4FileOpenTrace(m *bcc.Module) error {
@@ -132,8 +132,11 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	addPoint(m, "nfs_put_client")
 	addPoint(m, "update_open_stateid")
 	addPoint(m, "prepare_to_wait")
+	addPoint(m, "finish_wait")
 	addPoint(m, "nfs_state_log_update_open_stateid")
 	addPoint(m, "update_open_stateflags")
+
+	addPoint(m, "nfs_wait_bit_killable")
 	//
 	//  nfs4_atomic_open
 	//      nfs4_do_open (N/S)
@@ -142,9 +145,13 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//              nfs4_client_recover_expired_lease
 	//                  nfs4_wait_clnt_recover
 	//                      wait_on_bit_action (N/S)
-	//                          out_of_line_wait_on_bit (MULTIPLE CALLS)
+	//                          out_of_line_wait_on_bit
+	//                              __wait_on_bit
+	//                                  prepare_to_wait
+	//                                  nfs_wait_bit_killable (Callback) <== This function call could be slow (result/)
+	//                                  finish_wait
 	//                      nfs_put_client
-	//                  nfs4_schedule_state_manager (MULTIPLE CALLS)
+	//                  nfs4_schedule_state_manager
 	//              nfs4_opendata_alloc
 	//              _nfs4_open_and_get_state (N/S)
 	//                  _nfs4_proc_open (N/S)
@@ -194,14 +201,19 @@ func generateSource(config *Config) string {
 		strconv.FormatUint(uint64(config.SlowThresholdMS), 10), -1)
 }
 
+type eventPointData struct {
+	id    uint32
+	delta uint32
+}
+
 type eventData struct {
 	ts          uint64
-	pointsDelta [cSlowPointCount]uint64
-	pointsCount [cSlowPointCount]uint8
-	callOrder   [cCallOrderCount]uint8
-	delta       uint64
+	delta       uint32
+	pointIDs    [cCallOrderCount]uint8
+	pointDeltas [cCallOrderCount]uint32
+	callCounts  [cSlowPointCount]uint8
 	pid         uint32
-	comm        string
+	task        string
 	file        string
 }
 
@@ -213,12 +225,12 @@ func parseData(data []byte) (*eventData, error) {
 
 	event := &eventData{
 		ts:          cEvent.Ts,
-		pointsDelta: cEvent.PointsDelta,
-		pointsCount: cEvent.PointsCount,
-		callOrder:   cEvent.CallOrder,
-		delta:       cEvent.Delta,
+		delta:       uint32(cEvent.Delta),
+		pointIDs:    cEvent.PointIDs,
+		pointDeltas: cEvent.PointDeltas,
+		callCounts:  cEvent.CallCounts,
 		pid:         uint32(cEvent.PID),
-		comm:        cPointerToString(unsafe.Pointer(&cEvent.Task)),
+		task:        cPointerToString(unsafe.Pointer(&cEvent.Task)),
 		file:        cPointerToString(unsafe.Pointer(&cEvent.File)),
 	}
 
@@ -257,28 +269,27 @@ func Run(ctx context.Context, config *Config) {
 
 				log.Debug(
 					"event",
-					zap.Duration("duration", time.Duration(evt.delta)*time.Microsecond),
-					zap.Array("deltas", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
-						for _, dur := range evt.pointsDelta {
-							inner.AppendDuration(time.Duration(dur) * time.Microsecond)
+					zap.Duration("delta", time.Duration(evt.delta)*time.Microsecond),
+					zap.Array("points", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+						for i, id := range evt.pointIDs {
+							inner.AppendObject(zapcore.ObjectMarshalerFunc(func(inner2 zapcore.ObjectEncoder) error {
+								inner2.AddUint8("id", id)
+								inner2.AddDuration("delta", time.Duration(evt.pointDeltas[i])*time.Microsecond)
+								inner2.AddUint8("total", evt.callCounts[id])
+								return nil
+							}))
 						}
 						return nil
 					})),
 					zap.Array("counts", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
-						for _, c := range evt.pointsCount {
+						for _, c := range evt.callCounts {
 							inner.AppendUint8(c)
 						}
 						return nil
 					})),
-					zap.Array("order", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
-						for _, p := range evt.callOrder {
-							inner.AppendUint8(p)
-						}
-						return nil
-					})),
-					zap.String("comm", evt.comm),
-					zap.String("file", evt.file),
 					zap.Uint32("pid", evt.pid),
+					zap.String("task", evt.task),
+					zap.String("file", evt.file),
 				)
 			}
 		}
