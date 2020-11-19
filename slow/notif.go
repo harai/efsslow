@@ -30,7 +30,7 @@ var (
 
 const (
 	cTaskCommLen          = 16
-	cSlowPointCount       = 32
+	cSlowPointCount       = 48
 	cCallOrderCount       = 128
 	cDnameInlineLen       = 32
 	cNFS4StateidOtherSize = 12
@@ -68,31 +68,40 @@ func unpackSource(name string) string {
 var source string = unpackSource("trace.c")
 
 type eventCStruct struct {
-	Ts                    uint64
-	PointIDs              [cCallOrderCount]uint8
-	PointDeltas           [cCallOrderCount]uint32
-	CallCounts            [cSlowPointCount]uint8
-	Task                  [cTaskCommLen]byte
-	File                  [cDnameInlineLen]byte
-	PID                   uint64
-	Delta                 uint64
-	OpenStateidSeqid      [4]byte
-	OpenStateidOther      [cNFS4StateidOtherSize]byte
-	StateOpenStateidSeqid [4]byte
-	StateOpenStateidOther [cNFS4StateidOtherSize]byte
-	StateStateidSeqid     [4]byte
-	StateStateidOther     [cNFS4StateidOtherSize]byte
-	StateFlags            uint64
-	StateClientSession    uint64
-	OpenStateidType       uint32
-	StateNRdonly          uint32
-	StateNWronly          uint32
-	StateNRdwr            uint32
-	StateState            uint32
-	StateOpenStateidType  uint32
-	StateStateidType      uint32
-	OrderIndex            uint32
-	Show                  uint32
+	Ts                        uint64
+	PointIDs                  [cCallOrderCount]uint8
+	PointDeltas               [cCallOrderCount]uint32
+	CallCounts                [cSlowPointCount]uint8
+	Task                      [cTaskCommLen]byte
+	File                      [cDnameInlineLen]byte
+	PID                       uint64
+	Delta                     uint64
+	OpenStateidSeqid          [4]byte
+	OpenStateidOther          [cNFS4StateidOtherSize]byte
+	StateOpenStateidSeqid     [4]byte
+	StateOpenStateidOther     [cNFS4StateidOtherSize]byte
+	StateStateidSeqid         [4]byte
+	StateStateidOther         [cNFS4StateidOtherSize]byte
+	OpendataStateidSeqid      [4]byte
+	OpendataStateidOther      [cNFS4StateidOtherSize]byte
+	EnterRuntaskStateidSeqid  [4]byte
+	EnterRuntaskStateidOther  [cNFS4StateidOtherSize]byte
+	ReturnRuntaskStateidSeqid [4]byte
+	ReturnRuntaskStateidOther [cNFS4StateidOtherSize]byte
+	StateFlags                uint64
+	StateClientSession        uint64
+	OpenStateidType           uint32
+	StateNRdonly              uint32
+	StateNWronly              uint32
+	StateNRdwr                uint32
+	StateState                uint32
+	StateOpenStateidType      uint32
+	StateStateidType          uint32
+	OpendataStateidType       uint32
+	EnterRuntaskStateidType   uint32
+	ReturnRuntaskStateidType  uint32
+	OrderIndex                uint32
+	Show                      uint32
 }
 
 func configNfs4FileOpenTrace(m *bcc.Module) error {
@@ -148,6 +157,9 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	addPoint(m, "nfs4_client_recover_expired_lease")
 	addPoint(m, "nfs4_wait_clnt_recover")
 	addPoint(m, "nfs_put_client")
+	addPoint(m, "nfs4_opendata_alloc")
+	addPoint(m, "nfs4_get_open_state")
+	addPoint(m, "__nfs4_find_state_byowner")
 	addPoint(m, "update_open_stateid")
 	addPoint(m, "prepare_to_wait")
 	addPoint(m, "finish_wait")
@@ -187,6 +199,8 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//                  _nfs4_opendata_to_nfs4_state
 	//                      nfs4_opendata_find_nfs4_state (N/S)
 	//                          nfs4_opendata_get_inode (N/S)
+	//                          nfs4_get_open_state (Conditional)
+	//                            __nfs4_find_state_byowner
 	//                      nfs4_opendata_check_deleg (N/S)
 	//                          nfs_inode_set_delegation (Conditional)
 	//                          nfs_inode_reclaim_delegation (Conditional)
@@ -406,6 +420,15 @@ func (s *eventState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	return nil
 }
 
+type eventOpendata struct {
+	stateid *stateid
+}
+
+func (s *eventOpendata) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddObject("stateid", s.stateid)
+	return nil
+}
+
 type eventUpdateOpenStateid struct {
 	openStateid *eventOpenStateid
 	state       *eventState
@@ -422,15 +445,18 @@ func toBinaryRepr(v uint32) string {
 }
 
 type eventData struct {
-	ts                uint64
-	delta             uint32
-	pointIDs          [cCallOrderCount]uint8
-	pointDeltas       [cCallOrderCount]uint32
-	callCounts        [cSlowPointCount]uint8
-	updateOpenStateid *eventUpdateOpenStateid
-	pid               uint32
-	task              string
-	file              string
+	ts                   uint64
+	delta                uint32
+	pointIDs             [cCallOrderCount]uint8
+	pointDeltas          [cCallOrderCount]uint32
+	callCounts           [cSlowPointCount]uint8
+	opendata             *eventOpendata
+	enterRuntaskStateid  *stateid
+	returnRuntaskStateid *stateid
+	updateOpenStateid    *eventUpdateOpenStateid
+	pid                  uint32
+	task                 string
+	file                 string
 }
 
 func parseData(data []byte) (*eventData, error) {
@@ -445,6 +471,23 @@ func parseData(data []byte) (*eventData, error) {
 		pointIDs:    cEvent.PointIDs,
 		pointDeltas: cEvent.PointDeltas,
 		callCounts:  cEvent.CallCounts,
+		opendata: &eventOpendata{
+			stateid: &stateid{
+				seqid: asBigEndianUint32(cEvent.OpendataStateidSeqid),
+				other: cEvent.OpendataStateidOther,
+				type0: cEvent.OpendataStateidType,
+			},
+		},
+		enterRuntaskStateid: &stateid{
+			seqid: asBigEndianUint32(cEvent.EnterRuntaskStateidSeqid),
+			other: cEvent.EnterRuntaskStateidOther,
+			type0: cEvent.EnterRuntaskStateidType,
+		},
+		returnRuntaskStateid: &stateid{
+			seqid: asBigEndianUint32(cEvent.ReturnRuntaskStateidSeqid),
+			other: cEvent.ReturnRuntaskStateidOther,
+			type0: cEvent.ReturnRuntaskStateidType,
+		},
 		updateOpenStateid: &eventUpdateOpenStateid{
 			openStateid: &eventOpenStateid{
 				stateid: stateid{
@@ -530,6 +573,9 @@ func Run(ctx context.Context, config *Config) {
 						}
 						return nil
 					})),
+					zap.Object("nfs4_opendata_alloc() return o_res", evt.opendata),
+					zap.Object("nfs4_run_open_task() enter o_res", evt.enterRuntaskStateid),
+					zap.Object("nfs4_run_open_task() return o_res", evt.returnRuntaskStateid),
 					zap.Object("update_open_stateid()", evt.updateOpenStateid),
 					zap.Uint32("pid", evt.pid),
 					zap.String("task", evt.task),

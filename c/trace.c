@@ -7,7 +7,7 @@
 #include <uapi/linux/ptrace.h>
 
 #define SLOW_THRESHOLD_MS /*SLOW_THRESHOLD_MS*/
-#define SLOW_POINT_COUNT 32
+#define SLOW_POINT_COUNT 48
 #define CALL_ORDER_COUNT 128
 
 struct nfs4_state {
@@ -36,6 +36,31 @@ struct nfs4_state {
   struct rcu_head rcu_head;
 };
 
+struct nfs4_opendata {
+  struct kref kref;
+  struct nfs_openargs o_arg;
+  struct nfs_openres o_res;
+  struct nfs_open_confirmargs c_arg;
+  struct nfs_open_confirmres c_res;
+  struct nfs4_string owner_name;
+  struct nfs4_string group_name;
+  struct nfs4_label *a_label;
+  struct nfs_fattr f_attr;
+  struct nfs4_label *f_label;
+  struct dentry *dir;
+  struct dentry *dentry;
+  struct nfs4_state_owner *owner;
+  struct nfs4_state *state;
+  struct iattr attrs;
+  struct nfs4_layoutget *lgp;
+  unsigned long timestamp;
+  bool rpc_done;
+  bool file_created;
+  bool is_recover;
+  bool cancelled;
+  int rpc_status;
+};
+
 struct data_t {
   u64 ts;
   u8 point_ids[CALL_ORDER_COUNT];
@@ -51,6 +76,12 @@ struct data_t {
   char state_open_stateid_other[NFS4_STATEID_OTHER_SIZE];
   char state_stateid_seqid[4];
   char state_stateid_other[NFS4_STATEID_OTHER_SIZE];
+  char opendata_stateid_seqid[4];
+  char opendata_stateid_other[NFS4_STATEID_OTHER_SIZE];
+  char enter_runtask_stateid_seqid[4];
+  char enter_runtask_stateid_other[NFS4_STATEID_OTHER_SIZE];
+  char return_runtask_stateid_seqid[4];
+  char return_runtask_stateid_other[NFS4_STATEID_OTHER_SIZE];
   u64 state_flags;
   u64 state_client_session;
   u32 open_stateid_type;
@@ -60,6 +91,9 @@ struct data_t {
   u32 state_state;
   u32 state_open_stateid_type;
   u32 state_stateid_type;
+  u32 opendata_stateid_type;
+  u32 enter_runtask_stateid_type;
+  u32 return_runtask_stateid_type;
   u32 order_index;
   u32 show;
 } __attribute__((__packed__));
@@ -164,6 +198,90 @@ static int check_show(struct pt_regs *ctx, u8 point_id) {
   return 0;
 }
 
+static int check_nfs4_opendata_alloc(struct pt_regs *ctx, u8 point_id) {
+  u64 id = bpf_get_current_pid_tgid();
+  struct data_t *data = entryinfo.lookup(&id);
+  if (data == NULL) {
+    return 0;
+  }
+
+  add_data(data, point_id);
+  struct nfs4_opendata *opendata = (struct nfs4_opendata *)PT_REGS_RC(ctx);
+  if (opendata != NULL) {
+    bpf_probe_read_kernel(data->opendata_stateid_seqid, 4,
+                          &opendata->o_res.stateid.seqid);
+    bpf_probe_read_kernel(data->opendata_stateid_other, NFS4_STATEID_OTHER_SIZE,
+                          opendata->o_res.stateid.data);
+    bpf_probe_read_kernel(&data->opendata_stateid_type, sizeof(u32),
+                          &opendata->o_res.stateid.type);
+  }
+
+  entryinfo.update(&id, data);
+  return 0;
+}
+
+static int check_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
+  u64 id = bpf_get_current_pid_tgid();
+  struct data_t *data = entryinfo.lookup(&id);
+  if (data == NULL) {
+    return 0;
+  }
+
+  add_data(data, point_id);
+  struct nfs4_opendata *opendata = (struct nfs4_opendata *)PT_REGS_RC(ctx);
+  if (opendata != NULL) {
+    bpf_probe_read_kernel(data->opendata_stateid_seqid, 4,
+                          &opendata->o_res.stateid.seqid);
+    bpf_probe_read_kernel(data->opendata_stateid_other, NFS4_STATEID_OTHER_SIZE,
+                          opendata->o_res.stateid.data);
+    bpf_probe_read_kernel(&data->opendata_stateid_type, sizeof(u32),
+                          &opendata->o_res.stateid.type);
+  }
+
+  entryinfo.update(&id, data);
+  return 0;
+}
+
+static int check_enter_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
+                                          struct nfs4_opendata *opendata) {
+  u64 id = bpf_get_current_pid_tgid();
+  struct data_t *data = entryinfo.lookup(&id);
+  if (data == NULL) {
+    return 0;
+  }
+
+  add_data(data, point_id);
+  bpf_probe_read_kernel(data->enter_runtask_stateid_seqid, 4,
+                        &opendata->o_res.stateid.seqid);
+  bpf_probe_read_kernel(data->enter_runtask_stateid_other, NFS4_STATEID_OTHER_SIZE,
+                        opendata->o_res.stateid.data);
+  bpf_probe_read_kernel(&data->enter_runtask_stateid_type, sizeof(u32),
+                        &opendata->o_res.stateid.type);
+
+  entryinfo.update(&id, data);
+  return 0;
+}
+
+static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
+                                           struct nfs4_opendata *opendata) {
+  u64 id = bpf_get_current_pid_tgid();
+  struct data_t *data = entryinfo.lookup(&id);
+  if (data == NULL) {
+    return 0;
+  }
+
+  add_data(data, point_id);
+  bpf_probe_read_kernel(data->return_runtask_stateid_seqid, 4,
+                        &opendata->o_res.stateid.seqid);
+  bpf_probe_read_kernel(data->return_runtask_stateid_other, NFS4_STATEID_OTHER_SIZE,
+                        opendata->o_res.stateid.data);
+  bpf_probe_read_kernel(&data->return_runtask_stateid_type, sizeof(u32),
+                        &opendata->o_res.stateid.type);
+
+  entryinfo.update(&id, data);
+  return 0;
+}
+
 static int check_update_open_stateid(struct pt_regs *ctx, u8 point_id,
                                      struct nfs4_state *state,
                                      const nfs4_stateid *open_stateid,
@@ -219,6 +337,26 @@ int return__nfs4_wait_clnt_recover(struct pt_regs *ctx) { return check(ctx, 5); 
 int return__nfs4_client_recover_expired_lease(struct pt_regs *ctx) {
   return check(ctx, 6);
 }
+
+int enter__nfs4_opendata_alloc(struct pt_regs *ctx) { return check(ctx, 28); }
+int return__nfs4_opendata_alloc(struct pt_regs *ctx) {
+  return check_nfs4_opendata_alloc(ctx, 29);
+}
+
+int enter__nfs4_run_open_task(struct pt_regs *ctx, struct nfs4_opendata *data,
+                              struct nfs_open_context *ctx2) {
+  return check_enter_nfs4_run_open_task(ctx, 30, data);
+}
+int return__nfs4_run_open_task(struct pt_regs *ctx, struct nfs4_opendata *data,
+                               struct nfs_open_context *ctx2) {
+  return check_return_nfs4_run_open_task(ctx, 31, data);
+}
+
+int enter__nfs4_get_open_state(struct pt_regs *ctx) { return check(ctx, 24); }
+int enter____nfs4_find_state_byowner(struct pt_regs *ctx) { return check(ctx, 25); }
+int return____nfs4_find_state_byowner(struct pt_regs *ctx) { return check(ctx, 26); }
+int return__nfs4_get_open_state(struct pt_regs *ctx) { return check(ctx, 27); }
+
 int enter__update_open_stateid(struct pt_regs *ctx, struct nfs4_state *state,
                                const nfs4_stateid *open_stateid,
                                const nfs4_stateid *delegation, fmode_t fmode) {
