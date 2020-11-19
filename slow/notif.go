@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -21,17 +22,18 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-//go:generate statik -src=c
+// go:generate statik -src=c
 
 var (
 	log *zap.Logger
 )
 
 const (
-	cTaskCommLen    = 16
-	cSlowPointCount = 32
-	cCallOrderCount = 128
-	cDnameInlineLen = 32
+	cTaskCommLen          = 16
+	cSlowPointCount       = 32
+	cCallOrderCount       = 128
+	cDnameInlineLen       = 32
+	cNFS4StateidOtherSize = 12
 )
 
 // Config configures parameters to filter what to be notified.
@@ -66,15 +68,31 @@ func unpackSource(name string) string {
 var source string = unpackSource("trace.c")
 
 type eventCStruct struct {
-	Ts          uint64
-	PointIDs    [cCallOrderCount]uint8
-	PointDeltas [cCallOrderCount]uint32
-	CallCounts  [cSlowPointCount]uint8
-	Task        [cTaskCommLen]byte
-	File        [cDnameInlineLen]byte
-	PID         uint64
-	Delta       uint64
-	OrderIndex  uint64
+	Ts                    uint64
+	PointIDs              [cCallOrderCount]uint8
+	PointDeltas           [cCallOrderCount]uint32
+	CallCounts            [cSlowPointCount]uint8
+	Task                  [cTaskCommLen]byte
+	File                  [cDnameInlineLen]byte
+	PID                   uint64
+	Delta                 uint64
+	OpenStateidSeqid      [4]byte
+	OpenStateidOther      [cNFS4StateidOtherSize]byte
+	StateOpenStateidSeqid [4]byte
+	StateOpenStateidOther [cNFS4StateidOtherSize]byte
+	StateStateidSeqid     [4]byte
+	StateStateidOther     [cNFS4StateidOtherSize]byte
+	StateFlags            uint64
+	StateClientSession    uint64
+	OpenStateidType       uint32
+	StateNRdonly          uint32
+	StateNWronly          uint32
+	StateNRdwr            uint32
+	StateState            uint32
+	StateOpenStateidType  uint32
+	StateStateidType      uint32
+	OrderIndex            uint32
+	Show                  uint32
 }
 
 func configNfs4FileOpenTrace(m *bcc.Module) error {
@@ -133,8 +151,11 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	addPoint(m, "update_open_stateid")
 	addPoint(m, "prepare_to_wait")
 	addPoint(m, "finish_wait")
+	addPoint(m, "nfs4_schedule_state_manager") // Check if NFS_STATE_RECLAIM_NOGRACE flag is set.
 	addPoint(m, "nfs_state_log_update_open_stateid")
 	addPoint(m, "update_open_stateflags")
+
+	addPoint(m, "nfs4_state_mark_reclaim_nograce")
 
 	addPoint(m, "nfs_wait_bit_killable")
 	//
@@ -169,14 +190,17 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//                      nfs4_opendata_check_deleg (N/S)
 	//                          nfs_inode_set_delegation (Conditional)
 	//                          nfs_inode_reclaim_delegation (Conditional)
-	//                      update_open_stateid
+	//                      update_open_stateid (Conditional)
 	//                          nfs_state_set_open_stateid (N/S)
 	//                              nfs_set_open_stateid_locked (N/S)
 	//                                  prepare_to_wait
 	//                                  finish_wait
+	//                                  nfs_test_and_clear_all_open_stateid (Conditional, N/S)
+	//                                      nfs4_state_mark_reclaim_nograce <== This causes
 	//                                  nfs_state_log_update_open_stateid (Conditional)
 	//                          nfs_mark_delegation_referenced (Conditional)
-	//                          update_open_stateflags
+	//                          update_open_stateflags (Conditional)
+	//                          nfs4_schedule_state_manager (Conditional)
 	//                      nfs_release_seqid
 	//                  pnfs_parse_lgopen
 	//                  nfs4_opendata_access (N/S)
@@ -201,20 +225,212 @@ func generateSource(config *Config) string {
 		strconv.FormatUint(uint64(config.SlowThresholdMS), 10), -1)
 }
 
-type eventPointData struct {
-	id    uint32
-	delta uint32
+type stateid struct {
+	seqid uint32
+	other [cNFS4StateidOtherSize]byte
+	type0 uint32
+}
+
+func (s *stateid) otherHex() string {
+	return hex.EncodeToString(s.other[:])
+}
+
+func (s *stateid) typeName() string {
+	names := []string{
+		"NFS4_INVALID_STATEID_TYPE",
+		"NFS4_SPECIAL_STATEID_TYPE",
+		"NFS4_OPEN_STATEID_TYPE",
+		"NFS4_LOCK_STATEID_TYPE",
+		"NFS4_DELEGATION_STATEID_TYPE",
+		"NFS4_LAYOUT_STATEID_TYPE",
+		"NFS4_PNFS_DS_STATEID_TYPE",
+		"NFS4_REVOKED_STATEID_TYPE",
+	}
+	if int(s.type0) < len(names) {
+		return names[s.type0]
+	}
+
+	return "UNKNOWN_TYPE: " + strconv.Itoa(int(s.type0))
+}
+
+func (s *stateid) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddUint32("seqid", s.seqid)
+	enc.AddString("data", s.otherHex())
+	enc.AddString("type", s.typeName())
+	return nil
+}
+
+var stateFlags = []string{
+	"LK_STATE_IN_USE",
+	"NFS_DELEGATED_STATE",         // Current stateid is delegation
+	"NFS_OPEN_STATE",              // OPEN stateid is set
+	"NFS_O_RDONLY_STATE",          // OPEN stateid has read-only state
+	"NFS_O_WRONLY_STATE",          // OPEN stateid has write-only state
+	"NFS_O_RDWR_STATE",            // OPEN stateid has read/write state
+	"NFS_STATE_RECLAIM_REBOOT",    // OPEN stateid server rebooted
+	"NFS_STATE_RECLAIM_NOGRACE",   // OPEN stateid needs to recover state
+	"NFS_STATE_POSIX_LOCKS",       // Posix locks are supported
+	"NFS_STATE_RECOVERY_FAILED",   // OPEN stateid state recovery failed
+	"NFS_STATE_MAY_NOTIFY_LOCK",   // server may CB_NOTIFY_LOCK
+	"NFS_STATE_CHANGE_WAIT",       // A state changing operation is outstanding
+	"NFS_CLNT_DST_SSC_COPY_STATE", // dst server open state on client*/
+}
+
+var fmodeFlags = []string{
+	"FMODE_READ",            // file is open for reading
+	"FMODE_WRITE",           // file is open for writing
+	"FMODE_LSEEK",           // file is seekable
+	"FMODE_PREAD",           // file can be accessed using pread
+	"FMODE_PWRITE",          // file can be accessed using pwrite
+	"FMODE_EXEC",            // File is opened for execution with sys_execve / sys_uselib
+	"FMODE_NDELAY",          // File is opened with O_NDELAY (only set for block devices)
+	"FMODE_EXCL",            // File is opened with O_EXCL (only set for block devices)
+	"FMODE_WRITE_IOCTL",     // File is opened using open(.., 3, ..) and is writeable only for ioctls (specialy hack for floppy.c)
+	"FMODE_32BITHASH",       // 32bit hashes as llseek() offset (for directories)
+	"FMODE_64BITHASH",       // 64bit hashes as llseek() offset (for directories)
+	"FMODE_NOCMTIME",        // Don't update ctime and mtime. Currently a special hack for the XFS open_by_handle ioctl, but we'll hopefully graduate it to a proper O_CMTIME flag supported by open(2) soon.
+	"FMODE_RANDOM",          // Expect random access pattern
+	"FMODE_UNSIGNED_OFFSET", // File is huge (eg. /dev/kmem): treat loff_t as unsigned
+	"FMODE_PATH",            // File is opened with O_PATH; almost nothing can be done with it
+	"FMODE_ATOMIC_POS",      // File needs atomic accesses to f_pos
+	"FMODE_WRITER",          // Write access to underlying fs
+	"FMODE_CAN_READ",        // Has read method(s)
+	"FMODE_CAN_WRITE",       // Has write method(s)
+	"FMODE_OPENED",          //
+	"FMODE_CREATED",         //
+	"FMODE_STREAM",          // File is stream-like
+	"FMODE_NONOTIFY",        // File was opened by fanotify and shouldn't generate fanotify events
+	"FMODE_NOWAIT",          // File is capable of returning -EAGAIN if I/O will block
+	"FMODE_NEED_UNMOUNT",    // File represents mount that needs unmounting
+	"FMODE_NOACCOUNT",       // File does not contribute to nr_files count
+}
+
+func showFlags32(flags uint32, names []string) []string {
+	strs := []string{}
+
+	if 32 < len(names) {
+		log.Fatal("names size too long", zap.Array("names", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+			for _, n := range names {
+				inner.AppendString(n)
+			}
+			return nil
+		})))
+	}
+
+	for i := 0; i < len(names); i++ {
+		if flags>>i&0x1 == 0x0 {
+			continue
+		}
+		if names[i] == "" {
+			strs = append(strs, "Bit "+strconv.Itoa(i))
+			continue
+		}
+		strs = append(strs, names[i])
+	}
+
+	for i := len(names); i < 32; i++ {
+		if flags>>i&0x1 == 0x1 {
+			strs = append(strs, "Bit "+strconv.Itoa(i))
+		}
+	}
+
+	return strs
+}
+
+func showFlags64(flags uint64, names []string) []string {
+	strs := []string{}
+
+	if 64 < len(names) {
+		log.Fatal("names size too long", zap.Array("names", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+			for _, n := range names {
+				inner.AppendString(n)
+			}
+			return nil
+		})))
+	}
+
+	for i := 0; i < len(names); i++ {
+		if flags>>i&0x1 == 0x0 {
+			continue
+		}
+		if names[i] == "" {
+			strs = append(strs, "Bit "+strconv.Itoa(i))
+			continue
+		}
+		strs = append(strs, names[i])
+	}
+
+	for i := len(names); i < 64; i++ {
+		if flags>>i&0x1 == 0x1 {
+			strs = append(strs, "Bit "+strconv.Itoa(i))
+		}
+	}
+
+	return strs
+}
+
+type eventOpenStateid struct {
+	stateid
+}
+
+type eventState struct {
+	openStateid   *stateid
+	stateid       *stateid
+	flags         uint64
+	nRdonly       uint32
+	nWronly       uint32
+	nRdwr         uint32
+	state         uint32
+	clientSession uint64
+}
+
+func (s *eventState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddObject("openStateid", s.openStateid)
+	enc.AddObject("stateid", s.stateid)
+	enc.AddArray("flags", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+		for _, f := range showFlags64(s.flags, stateFlags) {
+			inner.AppendString(f)
+		}
+		return nil
+	}))
+	enc.AddUint32("n_rdonly", s.nRdonly)
+	enc.AddUint32("n_wronly", s.nWronly)
+	enc.AddUint32("n_rdwr", s.nRdwr)
+	enc.AddUint64("((struct nfs_server *)(inode->i_sb->s_fs_info))->nfs_client->cl_session", s.clientSession)
+	enc.AddArray("state", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+		for _, f := range showFlags32(s.state, fmodeFlags) {
+			inner.AppendString(f)
+		}
+		return nil
+	}))
+	return nil
+}
+
+type eventUpdateOpenStateid struct {
+	openStateid *eventOpenStateid
+	state       *eventState
+}
+
+func (u *eventUpdateOpenStateid) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddObject("openStateid", u.openStateid)
+	enc.AddObject("state", u.state)
+	return nil
+}
+
+func toBinaryRepr(v uint32) string {
+	return fmt.Sprintf("%032b", v)
 }
 
 type eventData struct {
-	ts          uint64
-	delta       uint32
-	pointIDs    [cCallOrderCount]uint8
-	pointDeltas [cCallOrderCount]uint32
-	callCounts  [cSlowPointCount]uint8
-	pid         uint32
-	task        string
-	file        string
+	ts                uint64
+	delta             uint32
+	pointIDs          [cCallOrderCount]uint8
+	pointDeltas       [cCallOrderCount]uint32
+	callCounts        [cSlowPointCount]uint8
+	updateOpenStateid *eventUpdateOpenStateid
+	pid               uint32
+	task              string
+	file              string
 }
 
 func parseData(data []byte) (*eventData, error) {
@@ -229,9 +445,36 @@ func parseData(data []byte) (*eventData, error) {
 		pointIDs:    cEvent.PointIDs,
 		pointDeltas: cEvent.PointDeltas,
 		callCounts:  cEvent.CallCounts,
-		pid:         uint32(cEvent.PID),
-		task:        cPointerToString(unsafe.Pointer(&cEvent.Task)),
-		file:        cPointerToString(unsafe.Pointer(&cEvent.File)),
+		updateOpenStateid: &eventUpdateOpenStateid{
+			openStateid: &eventOpenStateid{
+				stateid: stateid{
+					seqid: asBigEndianUint32(cEvent.OpenStateidSeqid),
+					other: cEvent.OpenStateidOther,
+					type0: cEvent.OpenStateidType,
+				},
+			},
+			state: &eventState{
+				openStateid: &stateid{
+					seqid: asBigEndianUint32(cEvent.StateOpenStateidSeqid),
+					other: cEvent.StateOpenStateidOther,
+					type0: cEvent.StateOpenStateidType,
+				},
+				stateid: &stateid{
+					seqid: asBigEndianUint32(cEvent.StateStateidSeqid),
+					other: cEvent.StateStateidOther,
+					type0: cEvent.StateStateidType,
+				},
+				flags:         cEvent.StateFlags,
+				nRdonly:       cEvent.StateNRdonly,
+				nWronly:       cEvent.StateNWronly,
+				nRdwr:         cEvent.StateNRdwr,
+				state:         cEvent.StateState,
+				clientSession: cEvent.StateClientSession,
+			},
+		},
+		pid:  uint32(cEvent.PID),
+		task: cPointerToString(unsafe.Pointer(&cEvent.Task)),
+		file: cPointerToString(unsafe.Pointer(&cEvent.File)),
 	}
 
 	return event, nil
@@ -287,6 +530,7 @@ func Run(ctx context.Context, config *Config) {
 						}
 						return nil
 					})),
+					zap.Object("update_open_stateid()", evt.updateOpenStateid),
 					zap.Uint32("pid", evt.pid),
 					zap.String("task", evt.task),
 					zap.String("file", evt.file),
