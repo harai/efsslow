@@ -88,18 +88,31 @@ type eventCStruct struct {
 	EnterRuntaskStateidOther  [cNFS4StateidOtherSize]byte
 	ReturnRuntaskStateidSeqid [4]byte
 	ReturnRuntaskStateidOther [cNFS4StateidOtherSize]byte
+	ToStateStateidSeqid       [4]byte
+	ToStateStateidOther       [cNFS4StateidOtherSize]byte
 	StateFlags                uint64
+	NograceStateFlags         uint64
+	ReturnNograceStateFlags   uint64
 	StateClientSession        uint64
 	OpenStateidType           uint32
 	StateNRdonly              uint32
 	StateNWronly              uint32
 	StateNRdwr                uint32
+	NograceExecuted           uint32
+	NograceStateNRdonly       uint32
+	NograceStateNWronly       uint32
+	NograceStateNRdwr         uint32
+	ReturnNograceExecuted     uint32
+	ReturnNograceStateNRdonly uint32
+	ReturnNograceStateNWronly uint32
+	ReturnNograceStateNRdwr   uint32
 	StateState                uint32
 	StateOpenStateidType      uint32
 	StateStateidType          uint32
 	OpendataStateidType       uint32
 	EnterRuntaskStateidType   uint32
 	ReturnRuntaskStateidType  uint32
+	ToStateStateidType        uint32
 	OrderIndex                uint32
 	Show                      uint32
 }
@@ -158,16 +171,18 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	addPoint(m, "nfs4_wait_clnt_recover")
 	addPoint(m, "nfs_put_client")
 	addPoint(m, "nfs4_opendata_alloc")
+	addPoint(m, "nfs4_run_open_task")
+	addPoint(m, "_nfs4_proc_open_confirm")
+	addPoint(m, "_nfs4_opendata_to_nfs4_state")
 	addPoint(m, "nfs4_get_open_state")
 	addPoint(m, "__nfs4_find_state_byowner")
 	addPoint(m, "update_open_stateid")
 	addPoint(m, "prepare_to_wait")
 	addPoint(m, "finish_wait")
+	addPoint(m, "nfs4_state_mark_reclaim_nograce")
 	addPoint(m, "nfs4_schedule_state_manager") // Check if NFS_STATE_RECLAIM_NOGRACE flag is set.
 	addPoint(m, "nfs_state_log_update_open_stateid")
 	addPoint(m, "update_open_stateflags")
-
-	addPoint(m, "nfs4_state_mark_reclaim_nograce")
 
 	addPoint(m, "nfs_wait_bit_killable")
 	//
@@ -440,8 +455,43 @@ func (u *eventUpdateOpenStateid) MarshalLogObject(enc zapcore.ObjectEncoder) err
 	return nil
 }
 
+type eventNograceState struct {
+	executed bool
+	flags    uint64
+	nRdonly  uint32
+	nWronly  uint32
+	nRdwr    uint32
+}
+
+func (n *eventNograceState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddBool("executed", n.executed)
+	enc.AddArray("flags", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+		for _, f := range showFlags64(n.flags, stateFlags) {
+			inner.AppendString(f)
+		}
+		return nil
+	}))
+	enc.AddUint32("n_rdonly", n.nRdonly)
+	enc.AddUint32("n_wronly", n.nWronly)
+	enc.AddUint32("n_rdwr", n.nRdwr)
+	return nil
+}
+
 func toBinaryRepr(v uint32) string {
 	return fmt.Sprintf("%032b", v)
+}
+
+type optionalStateid struct {
+	*stateid
+	executed bool
+}
+
+func (s *optionalStateid) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddBool("executed", s.executed)
+	enc.AddUint32("seqid", s.seqid)
+	enc.AddString("data", s.otherHex())
+	enc.AddString("type", s.typeName())
+	return nil
 }
 
 type eventData struct {
@@ -453,10 +503,15 @@ type eventData struct {
 	opendata             *eventOpendata
 	enterRuntaskStateid  *stateid
 	returnRuntaskStateid *stateid
+	toStateStateid       *stateid
 	updateOpenStateid    *eventUpdateOpenStateid
+	nograceState         *eventNograceState
+	returnNograceState   *eventNograceState
 	pid                  uint32
 	task                 string
 	file                 string
+	show                 bool
+	returnRuntaskDone    bool
 }
 
 func parseData(data []byte) (*eventData, error) {
@@ -488,6 +543,11 @@ func parseData(data []byte) (*eventData, error) {
 			other: cEvent.ReturnRuntaskStateidOther,
 			type0: cEvent.ReturnRuntaskStateidType,
 		},
+		toStateStateid: &stateid{
+			seqid: asBigEndianUint32(cEvent.ToStateStateidSeqid),
+			other: cEvent.ToStateStateidOther,
+			type0: cEvent.ToStateStateidType,
+		},
 		updateOpenStateid: &eventUpdateOpenStateid{
 			openStateid: &eventOpenStateid{
 				stateid: stateid{
@@ -515,9 +575,24 @@ func parseData(data []byte) (*eventData, error) {
 				clientSession: cEvent.StateClientSession,
 			},
 		},
+		nograceState: &eventNograceState{
+			executed: cEvent.NograceExecuted != 0,
+			flags:    cEvent.NograceStateFlags,
+			nRdonly:  cEvent.NograceStateNRdonly,
+			nWronly:  cEvent.NograceStateNWronly,
+			nRdwr:    cEvent.NograceStateNRdwr,
+		},
+		returnNograceState: &eventNograceState{
+			executed: cEvent.ReturnNograceExecuted != 0,
+			flags:    cEvent.ReturnNograceStateFlags,
+			nRdonly:  cEvent.ReturnNograceStateNRdonly,
+			nWronly:  cEvent.ReturnNograceStateNWronly,
+			nRdwr:    cEvent.ReturnNograceStateNRdwr,
+		},
 		pid:  uint32(cEvent.PID),
 		task: cPointerToString(unsafe.Pointer(&cEvent.Task)),
 		file: cPointerToString(unsafe.Pointer(&cEvent.File)),
+		show: cEvent.Show != 0,
 	}
 
 	return event, nil
@@ -576,10 +651,14 @@ func Run(ctx context.Context, config *Config) {
 					zap.Object("nfs4_opendata_alloc() return o_res", evt.opendata),
 					zap.Object("nfs4_run_open_task() enter o_res", evt.enterRuntaskStateid),
 					zap.Object("nfs4_run_open_task() return o_res", evt.returnRuntaskStateid),
+					zap.Object("_nfs4_opendata_to_nfs4_state() enter o_res", evt.toStateStateid),
 					zap.Object("update_open_stateid()", evt.updateOpenStateid),
+					zap.Object("nfs4_state_mark_reclaim_nograce() enter", evt.nograceState),
+					zap.Object("nfs4_state_mark_reclaim_nograce() return", evt.returnNograceState),
 					zap.Uint32("pid", evt.pid),
 					zap.String("task", evt.task),
 					zap.String("file", evt.file),
+					zap.Bool("show", evt.show),
 				)
 			}
 		}

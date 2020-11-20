@@ -82,18 +82,31 @@ struct data_t {
   char enter_runtask_stateid_other[NFS4_STATEID_OTHER_SIZE];
   char return_runtask_stateid_seqid[4];
   char return_runtask_stateid_other[NFS4_STATEID_OTHER_SIZE];
+  char to_state_stateid_seqid[4];
+  char to_state_stateid_other[NFS4_STATEID_OTHER_SIZE];
   u64 state_flags;
+  u64 nograce_state_flags;
+  u64 return_nograce_state_flags;
   u64 state_client_session;
   u32 open_stateid_type;
   u32 state_n_rdonly;
   u32 state_n_wronly;
   u32 state_n_rdwr;
+  u32 nograce_executed;
+  u32 nograce_state_n_rdonly;
+  u32 nograce_state_n_wronly;
+  u32 nograce_state_n_rdwr;
+  u32 return_nograce_executed;
+  u32 return_nograce_state_n_rdonly;
+  u32 return_nograce_state_n_wronly;
+  u32 return_nograce_state_n_rdwr;
   u32 state_state;
   u32 state_open_stateid_type;
   u32 state_stateid_type;
   u32 opendata_stateid_type;
   u32 enter_runtask_stateid_type;
   u32 return_runtask_stateid_type;
+  u32 to_state_stateid_type;
   u32 order_index;
   u32 show;
 } __attribute__((__packed__));
@@ -124,6 +137,18 @@ int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file 
     data->point_ids[i] = 0;
     data->point_deltas[i] = 0;
   }
+
+  // Initialize conditional data
+  data->nograce_executed = 0;
+  data->nograce_state_flags = 0;
+  data->nograce_state_n_rdonly = 0;
+  data->nograce_state_n_wronly = 0;
+  data->nograce_state_n_rdwr = 0;
+  data->return_nograce_executed = 0;
+  data->return_nograce_state_flags = 0;
+  data->return_nograce_state_n_rdonly = 0;
+  data->return_nograce_state_n_wronly = 0;
+  data->return_nograce_state_n_rdwr = 0;
 
   u64 id = bpf_get_current_pid_tgid();
   entryinfo.update(&id, data);
@@ -181,6 +206,8 @@ static int check(struct pt_regs *ctx, u8 point_id) {
   return 0;
 }
 
+BPF_HASH(nfs4_state_mark_reclaim_nograce_state, u64, struct nfs4_state *);
+
 static int check_show(struct pt_regs *ctx, u8 point_id) {
   u64 id = bpf_get_current_pid_tgid();
   struct data_t *data = entryinfo.lookup(&id);
@@ -188,12 +215,27 @@ static int check_show(struct pt_regs *ctx, u8 point_id) {
     return 0;
   }
 
+  struct nfs4_state **stpp = nfs4_state_mark_reclaim_nograce_state.lookup(&id);
+  if (stpp == NULL) {
+    return 0;
+  }
+  struct nfs4_state *state = *stpp;
+
   add_data(data, point_id);
   int ret = PT_REGS_RC(ctx);
   if (ret == 1) {
     data->show = 1;
   }
 
+  bpf_probe_read_kernel(&data->return_nograce_state_flags, sizeof(u64), &state->flags);
+  bpf_probe_read_kernel(&data->return_nograce_state_n_rdonly, sizeof(u32),
+                        &state->n_rdonly);
+  bpf_probe_read_kernel(&data->return_nograce_state_n_wronly, sizeof(u32),
+                        &state->n_wronly);
+  bpf_probe_read_kernel(&data->return_nograce_state_n_rdwr, sizeof(u32), &state->n_rdwr);
+  data->return_nograce_executed = 1;
+
+  nfs4_state_mark_reclaim_nograce_state.delete(&id);
   entryinfo.update(&id, data);
   return 0;
 }
@@ -242,6 +284,8 @@ static int check_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
   return 0;
 }
 
+BPF_HASH(nfs4_run_open_task_opendata, u64, struct nfs4_opendata *);
+
 static int check_enter_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
                                           struct nfs4_opendata *opendata) {
   u64 id = bpf_get_current_pid_tgid();
@@ -258,17 +302,62 @@ static int check_enter_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
   bpf_probe_read_kernel(&data->enter_runtask_stateid_type, sizeof(u32),
                         &opendata->o_res.stateid.type);
 
+  nfs4_run_open_task_opendata.update(&id, &opendata);
   entryinfo.update(&id, data);
   return 0;
 }
 
-static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
-                                           struct nfs4_opendata *opendata) {
+static int check__nfs4_opendata_to_nfs4_state(struct pt_regs *ctx, u8 point_id,
+                                              struct nfs4_opendata *opendata) {
   u64 id = bpf_get_current_pid_tgid();
   struct data_t *data = entryinfo.lookup(&id);
   if (data == NULL) {
     return 0;
   }
+
+  add_data(data, point_id);
+  bpf_probe_read_kernel(data->to_state_stateid_seqid, 4, &opendata->o_res.stateid.seqid);
+  bpf_probe_read_kernel(data->to_state_stateid_other, NFS4_STATEID_OTHER_SIZE,
+                        opendata->o_res.stateid.data);
+  bpf_probe_read_kernel(&data->to_state_stateid_type, sizeof(u32),
+                        &opendata->o_res.stateid.type);
+
+  entryinfo.update(&id, data);
+  return 0;
+}
+
+static int check_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, u8 point_id,
+                                                 struct nfs4_state *state) {
+  u64 id = bpf_get_current_pid_tgid();
+  struct data_t *data = entryinfo.lookup(&id);
+  if (data == NULL) {
+    return 0;
+  }
+
+  add_data(data, point_id);
+  bpf_probe_read_kernel(&data->nograce_state_flags, sizeof(u64), &state->flags);
+  bpf_probe_read_kernel(&data->nograce_state_n_rdonly, sizeof(u32), &state->n_rdonly);
+  bpf_probe_read_kernel(&data->nograce_state_n_wronly, sizeof(u32), &state->n_wronly);
+  bpf_probe_read_kernel(&data->nograce_state_n_rdwr, sizeof(u32), &state->n_rdwr);
+  data->nograce_executed = 1;
+
+  nfs4_state_mark_reclaim_nograce_state.update(&id, &state);
+  entryinfo.update(&id, data);
+  return 0;
+}
+
+static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
+  u64 id = bpf_get_current_pid_tgid();
+  struct data_t *data = entryinfo.lookup(&id);
+  if (data == NULL) {
+    return 0;
+  }
+
+  struct nfs4_opendata **odpp = nfs4_run_open_task_opendata.lookup(&id);
+  if (odpp == NULL) {
+    return 0;
+  }
+  struct nfs4_opendata *opendata = *odpp;
 
   add_data(data, point_id);
   bpf_probe_read_kernel(data->return_runtask_stateid_seqid, 4,
@@ -278,6 +367,7 @@ static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
   bpf_probe_read_kernel(&data->return_runtask_stateid_type, sizeof(u32),
                         &opendata->o_res.stateid.type);
 
+  nfs4_run_open_task_opendata.delete(&id);
   entryinfo.update(&id, data);
   return 0;
 }
@@ -347,10 +437,21 @@ int enter__nfs4_run_open_task(struct pt_regs *ctx, struct nfs4_opendata *data,
                               struct nfs_open_context *ctx2) {
   return check_enter_nfs4_run_open_task(ctx, 30, data);
 }
-int return__nfs4_run_open_task(struct pt_regs *ctx, struct nfs4_opendata *data,
-                               struct nfs_open_context *ctx2) {
-  return check_return_nfs4_run_open_task(ctx, 31, data);
+int return__nfs4_run_open_task(struct pt_regs *ctx) {
+  return check_return_nfs4_run_open_task(ctx, 31);
 }
+
+int enter___nfs4_proc_open_confirm(struct pt_regs *ctx, struct nfs4_opendata *data) {
+  return check(ctx, 34);
+}
+int return___nfs4_proc_open_confirm(struct pt_regs *ctx, struct nfs4_opendata *data) {
+  return check(ctx, 35);
+}
+
+int enter___nfs4_opendata_to_nfs4_state(struct pt_regs *ctx, struct nfs4_opendata *data) {
+  return check__nfs4_opendata_to_nfs4_state(ctx, 32, data);
+}
+int return___nfs4_opendata_to_nfs4_state(struct pt_regs *ctx) { return check(ctx, 33); }
 
 int enter__nfs4_get_open_state(struct pt_regs *ctx) { return check(ctx, 24); }
 int enter____nfs4_find_state_byowner(struct pt_regs *ctx) { return check(ctx, 25); }
@@ -382,7 +483,10 @@ int return__update_open_stateflags(struct pt_regs *ctx) { return check(ctx, 15);
 int return__update_open_stateid(struct pt_regs *ctx) { return check(ctx, 16); }
 int return__nfs4_atomic_open(struct pt_regs *ctx) { return check(ctx, 17); }
 
-int enter__nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx) { return check(ctx, 22); }
+int enter__nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx,
+                                           struct nfs4_state *state) {
+  return check_nfs4_state_mark_reclaim_nograce(ctx, 22, state);
+}
 int return__nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx) {
   return check_show(ctx, 23);
 }
