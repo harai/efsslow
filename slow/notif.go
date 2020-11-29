@@ -67,6 +67,12 @@ func unpackSource(name string) string {
 
 var source string = unpackSource("trace.c")
 
+type eventStateidCStruct struct {
+	Seqid [4]byte
+	Other [cNFS4StateidOtherSize]byte
+	Type  uint32
+}
+
 type eventCStruct struct {
 	Ts                        uint64
 	PointIDs                  [cCallOrderCount]uint8
@@ -76,25 +82,17 @@ type eventCStruct struct {
 	File                      [cDnameInlineLen]byte
 	PID                       uint64
 	Delta                     uint64
-	OpenStateidSeqid          [4]byte
-	OpenStateidOther          [cNFS4StateidOtherSize]byte
-	StateOpenStateidSeqid     [4]byte
-	StateOpenStateidOther     [cNFS4StateidOtherSize]byte
-	StateStateidSeqid         [4]byte
-	StateStateidOther         [cNFS4StateidOtherSize]byte
-	OpendataStateidSeqid      [4]byte
-	OpendataStateidOther      [cNFS4StateidOtherSize]byte
-	EnterRuntaskStateidSeqid  [4]byte
-	EnterRuntaskStateidOther  [cNFS4StateidOtherSize]byte
-	ReturnRuntaskStateidSeqid [4]byte
-	ReturnRuntaskStateidOther [cNFS4StateidOtherSize]byte
-	ToStateStateidSeqid       [4]byte
-	ToStateStateidOther       [cNFS4StateidOtherSize]byte
+	OpenStateid               eventStateidCStruct
+	StateOpenStateid          eventStateidCStruct
+	StateStateid              eventStateidCStruct
+	OpendataStateid           eventStateidCStruct
+	EnterRuntaskStateid       eventStateidCStruct
+	ReturnRuntaskStateid      eventStateidCStruct
+	ToStateStateid            eventStateidCStruct
 	StateFlags                uint64
 	NograceStateFlags         uint64
 	ReturnNograceStateFlags   uint64
 	StateClientSession        uint64
-	OpenStateidType           uint32
 	StateNRdonly              uint32
 	StateNWronly              uint32
 	StateNRdwr                uint32
@@ -107,12 +105,6 @@ type eventCStruct struct {
 	ReturnNograceStateNWronly uint32
 	ReturnNograceStateNRdwr   uint32
 	StateState                uint32
-	StateOpenStateidType      uint32
-	StateStateidType          uint32
-	OpendataStateidType       uint32
-	EnterRuntaskStateidType   uint32
-	ReturnRuntaskStateidType  uint32
-	ToStateStateidType        uint32
 	OrderIndex                uint32
 	Show                      uint32
 }
@@ -260,6 +252,14 @@ type stateid struct {
 	type0 uint32
 }
 
+func newStateidFromCStruct(v *eventStateidCStruct) *stateid {
+	return &stateid{
+		seqid: asBigEndianUint32(v.Seqid),
+		other: v.Other,
+		type0: v.Type,
+	}
+}
+
 func (s *stateid) otherHex() string {
 	return hex.EncodeToString(s.other[:])
 }
@@ -398,10 +398,6 @@ func showFlags64(flags uint64, names []string) []string {
 	return strs
 }
 
-type eventOpenStateid struct {
-	stateid
-}
-
 type eventState struct {
 	openStateid   *stateid
 	stateid       *stateid
@@ -422,6 +418,7 @@ func (s *eventState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 		}
 		return nil
 	}))
+	enc.AddUint64("flags(num)", s.flags)
 	enc.AddUint32("n_rdonly", s.nRdonly)
 	enc.AddUint32("n_wronly", s.nWronly)
 	enc.AddUint32("n_rdwr", s.nRdwr)
@@ -445,7 +442,7 @@ func (s *eventOpendata) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 }
 
 type eventUpdateOpenStateid struct {
-	openStateid *eventOpenStateid
+	openStateid *stateid
 	state       *eventState
 }
 
@@ -471,6 +468,7 @@ func (n *eventNograceState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 		}
 		return nil
 	}))
+	enc.AddUint64("flags(num)", n.flags)
 	enc.AddUint32("n_rdonly", n.nRdonly)
 	enc.AddUint32("n_wronly", n.nWronly)
 	enc.AddUint32("n_rdwr", n.nRdwr)
@@ -527,46 +525,16 @@ func parseData(data []byte) (*eventData, error) {
 		pointDeltas: cEvent.PointDeltas,
 		callCounts:  cEvent.CallCounts,
 		opendata: &eventOpendata{
-			stateid: &stateid{
-				seqid: asBigEndianUint32(cEvent.OpendataStateidSeqid),
-				other: cEvent.OpendataStateidOther,
-				type0: cEvent.OpendataStateidType,
-			},
+			stateid: newStateidFromCStruct(&cEvent.OpenStateid),
 		},
-		enterRuntaskStateid: &stateid{
-			seqid: asBigEndianUint32(cEvent.EnterRuntaskStateidSeqid),
-			other: cEvent.EnterRuntaskStateidOther,
-			type0: cEvent.EnterRuntaskStateidType,
-		},
-		returnRuntaskStateid: &stateid{
-			seqid: asBigEndianUint32(cEvent.ReturnRuntaskStateidSeqid),
-			other: cEvent.ReturnRuntaskStateidOther,
-			type0: cEvent.ReturnRuntaskStateidType,
-		},
-		toStateStateid: &stateid{
-			seqid: asBigEndianUint32(cEvent.ToStateStateidSeqid),
-			other: cEvent.ToStateStateidOther,
-			type0: cEvent.ToStateStateidType,
-		},
+		enterRuntaskStateid:  newStateidFromCStruct(&cEvent.EnterRuntaskStateid),
+		returnRuntaskStateid: newStateidFromCStruct(&cEvent.ReturnRuntaskStateid),
+		toStateStateid:       newStateidFromCStruct(&cEvent.ToStateStateid),
 		updateOpenStateid: &eventUpdateOpenStateid{
-			openStateid: &eventOpenStateid{
-				stateid: stateid{
-					seqid: asBigEndianUint32(cEvent.OpenStateidSeqid),
-					other: cEvent.OpenStateidOther,
-					type0: cEvent.OpenStateidType,
-				},
-			},
+			openStateid: newStateidFromCStruct(&cEvent.OpenStateid),
 			state: &eventState{
-				openStateid: &stateid{
-					seqid: asBigEndianUint32(cEvent.StateOpenStateidSeqid),
-					other: cEvent.StateOpenStateidOther,
-					type0: cEvent.StateOpenStateidType,
-				},
-				stateid: &stateid{
-					seqid: asBigEndianUint32(cEvent.StateStateidSeqid),
-					other: cEvent.StateStateidOther,
-					type0: cEvent.StateStateidType,
-				},
+				openStateid:   newStateidFromCStruct(&cEvent.StateOpenStateid),
+				stateid:       newStateidFromCStruct(&cEvent.StateStateid),
 				flags:         cEvent.StateFlags,
 				nRdonly:       cEvent.StateNRdonly,
 				nWronly:       cEvent.StateNWronly,

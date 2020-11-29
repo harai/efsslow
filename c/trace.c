@@ -61,6 +61,12 @@ struct nfs4_opendata {
   int rpc_status;
 };
 
+struct data_stateid_t {
+  char seqid[4];
+  char other[NFS4_STATEID_OTHER_SIZE];
+  u32 type;
+} __attribute__((__packed__));
+
 struct data_t {
   u64 ts;
   u8 point_ids[CALL_ORDER_COUNT];
@@ -70,25 +76,17 @@ struct data_t {
   char file[DNAME_INLINE_LEN];
   u64 pid;
   u64 delta;
-  char open_stateid_seqid[4];
-  char open_stateid_other[NFS4_STATEID_OTHER_SIZE];
-  char state_open_stateid_seqid[4];
-  char state_open_stateid_other[NFS4_STATEID_OTHER_SIZE];
-  char state_stateid_seqid[4];
-  char state_stateid_other[NFS4_STATEID_OTHER_SIZE];
-  char opendata_stateid_seqid[4];
-  char opendata_stateid_other[NFS4_STATEID_OTHER_SIZE];
-  char enter_runtask_stateid_seqid[4];
-  char enter_runtask_stateid_other[NFS4_STATEID_OTHER_SIZE];
-  char return_runtask_stateid_seqid[4];
-  char return_runtask_stateid_other[NFS4_STATEID_OTHER_SIZE];
-  char to_state_stateid_seqid[4];
-  char to_state_stateid_other[NFS4_STATEID_OTHER_SIZE];
+  struct data_stateid_t open_stateid;
+  struct data_stateid_t state_open_stateid;
+  struct data_stateid_t state_stateid;
+  struct data_stateid_t opendata_stateid;
+  struct data_stateid_t enter_runtask_stateid;
+  struct data_stateid_t return_runtask_stateid;
+  struct data_stateid_t to_state_stateid;
   u64 state_flags;
   u64 nograce_state_flags;
   u64 return_nograce_state_flags;
   u64 state_client_session;
-  u32 open_stateid_type;
   u32 state_n_rdonly;
   u32 state_n_wronly;
   u32 state_n_rdwr;
@@ -101,12 +99,6 @@ struct data_t {
   u32 return_nograce_state_n_wronly;
   u32 return_nograce_state_n_rdwr;
   u32 state_state;
-  u32 state_open_stateid_type;
-  u32 state_stateid_type;
-  u32 opendata_stateid_type;
-  u32 enter_runtask_stateid_type;
-  u32 return_runtask_stateid_type;
-  u32 to_state_stateid_type;
   u32 order_index;
   u32 show;
 } __attribute__((__packed__));
@@ -114,6 +106,12 @@ struct data_t {
 BPF_PERCPU_ARRAY(store, struct data_t, 1);
 BPF_HASH(entryinfo, u64, struct data_t);
 BPF_PERF_OUTPUT(events);
+
+static void copy_stateid(struct data_stateid_t *dst, const nfs4_stateid *src) {
+  bpf_probe_read_kernel(dst->seqid, 4, (char *)(&src->seqid));
+  bpf_probe_read_kernel(dst->other, NFS4_STATEID_OTHER_SIZE, src->other);
+  bpf_probe_read_kernel(&dst->type, sizeof(u32), &src->type);
+}
 
 int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
   int zero = 0;
@@ -250,12 +248,7 @@ static int check_nfs4_opendata_alloc(struct pt_regs *ctx, u8 point_id) {
   add_data(data, point_id);
   struct nfs4_opendata *opendata = (struct nfs4_opendata *)PT_REGS_RC(ctx);
   if (opendata != NULL) {
-    bpf_probe_read_kernel(data->opendata_stateid_seqid, 4,
-                          &opendata->o_res.stateid.seqid);
-    bpf_probe_read_kernel(data->opendata_stateid_other, NFS4_STATEID_OTHER_SIZE,
-                          opendata->o_res.stateid.data);
-    bpf_probe_read_kernel(&data->opendata_stateid_type, sizeof(u32),
-                          &opendata->o_res.stateid.type);
+    copy_stateid(&data->opendata_stateid, &opendata->o_res.stateid);
   }
 
   entryinfo.update(&id, data);
@@ -272,12 +265,7 @@ static int check_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
   add_data(data, point_id);
   struct nfs4_opendata *opendata = (struct nfs4_opendata *)PT_REGS_RC(ctx);
   if (opendata != NULL) {
-    bpf_probe_read_kernel(data->opendata_stateid_seqid, 4,
-                          &opendata->o_res.stateid.seqid);
-    bpf_probe_read_kernel(data->opendata_stateid_other, NFS4_STATEID_OTHER_SIZE,
-                          opendata->o_res.stateid.data);
-    bpf_probe_read_kernel(&data->opendata_stateid_type, sizeof(u32),
-                          &opendata->o_res.stateid.type);
+    copy_stateid(&data->opendata_stateid, &opendata->o_res.stateid);
   }
 
   entryinfo.update(&id, data);
@@ -295,12 +283,7 @@ static int check_enter_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
   }
 
   add_data(data, point_id);
-  bpf_probe_read_kernel(data->enter_runtask_stateid_seqid, 4,
-                        &opendata->o_res.stateid.seqid);
-  bpf_probe_read_kernel(data->enter_runtask_stateid_other, NFS4_STATEID_OTHER_SIZE,
-                        opendata->o_res.stateid.data);
-  bpf_probe_read_kernel(&data->enter_runtask_stateid_type, sizeof(u32),
-                        &opendata->o_res.stateid.type);
+  copy_stateid(&data->enter_runtask_stateid, &opendata->o_res.stateid);
 
   nfs4_run_open_task_opendata.update(&id, &opendata);
   entryinfo.update(&id, data);
@@ -316,11 +299,7 @@ static int check__nfs4_opendata_to_nfs4_state(struct pt_regs *ctx, u8 point_id,
   }
 
   add_data(data, point_id);
-  bpf_probe_read_kernel(data->to_state_stateid_seqid, 4, &opendata->o_res.stateid.seqid);
-  bpf_probe_read_kernel(data->to_state_stateid_other, NFS4_STATEID_OTHER_SIZE,
-                        opendata->o_res.stateid.data);
-  bpf_probe_read_kernel(&data->to_state_stateid_type, sizeof(u32),
-                        &opendata->o_res.stateid.type);
+  copy_stateid(&data->to_state_stateid, &opendata->o_res.stateid);
 
   entryinfo.update(&id, data);
   return 0;
@@ -360,12 +339,7 @@ static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
   struct nfs4_opendata *opendata = *odpp;
 
   add_data(data, point_id);
-  bpf_probe_read_kernel(data->return_runtask_stateid_seqid, 4,
-                        &opendata->o_res.stateid.seqid);
-  bpf_probe_read_kernel(data->return_runtask_stateid_other, NFS4_STATEID_OTHER_SIZE,
-                        opendata->o_res.stateid.data);
-  bpf_probe_read_kernel(&data->return_runtask_stateid_type, sizeof(u32),
-                        &opendata->o_res.stateid.type);
+  copy_stateid(&data->return_runtask_stateid, &opendata->o_res.stateid);
 
   nfs4_run_open_task_opendata.delete(&id);
   entryinfo.update(&id, data);
@@ -383,24 +357,14 @@ static int check_update_open_stateid(struct pt_regs *ctx, u8 point_id,
   }
 
   add_data(data, point_id);
-  bpf_probe_read_kernel(data->open_stateid_seqid, 4, &open_stateid->seqid);
-  bpf_probe_read_kernel(data->open_stateid_other, NFS4_STATEID_OTHER_SIZE,
-                        open_stateid->other);
-  bpf_probe_read_kernel(data->state_open_stateid_seqid, 4, &state->open_stateid.seqid);
-  bpf_probe_read_kernel(data->state_open_stateid_other, NFS4_STATEID_OTHER_SIZE,
-                        state->open_stateid.data);
-  bpf_probe_read_kernel(data->state_stateid_seqid, 4, &state->stateid.seqid);
-  bpf_probe_read_kernel(data->state_stateid_other, NFS4_STATEID_OTHER_SIZE,
-                        state->stateid.other);
+  copy_stateid(&data->open_stateid, open_stateid);
+  copy_stateid(&data->state_open_stateid, &state->open_stateid);
+  copy_stateid(&data->state_stateid, &state->stateid);
   bpf_probe_read_kernel(&data->state_flags, sizeof(u64), &state->flags);
-  bpf_probe_read_kernel(&data->open_stateid_type, sizeof(u32), &open_stateid->type);
   bpf_probe_read_kernel(&data->state_n_rdwr, sizeof(u32), &state->n_rdwr);
   bpf_probe_read_kernel(&data->state_n_wronly, sizeof(u32), &state->n_wronly);
   bpf_probe_read_kernel(&data->state_n_rdonly, sizeof(u32), &state->n_rdonly);
   bpf_probe_read_kernel(&data->state_state, sizeof(u32), &state->state);
-  bpf_probe_read_kernel(&data->state_open_stateid_type, sizeof(u32),
-                        &state->open_stateid.type);
-  bpf_probe_read_kernel(&data->state_stateid_type, sizeof(u32), &state->stateid.type);
   bpf_probe_read_kernel(
       &data->state_client_session, sizeof(u64),
       &((struct nfs_server *)(state->inode->i_sb->s_fs_info))->nfs_client->cl_session);
