@@ -84,26 +84,41 @@ type eventStateCStruct struct {
 }
 
 type eventCStruct struct {
-	Ts                   uint64
-	PointIDs             [cCallOrderCount]uint8
-	PointDeltas          [cCallOrderCount]uint32
-	CallCounts           [cSlowPointCount]uint8
-	Task                 [cTaskCommLen]byte
-	File                 [cDnameInlineLen]byte
-	PID                  uint64
-	Delta                uint64
-	OpenStateid          eventStateidCStruct
-	OpendataStateid      eventStateidCStruct
-	EnterRuntaskStateid  eventStateidCStruct
-	ReturnRuntaskStateid eventStateidCStruct
-	ToStateStateid       eventStateidCStruct
-	State                eventStateCStruct
-	EnterNograceState    eventStateCStruct
-	ReturnNograceState   eventStateCStruct
-	NograceExecuted      uint32
-	NograceResult        uint32
-	OrderIndex           uint32
-	Show                 uint32
+	Ts                             uint64
+	PointIDs                       [cCallOrderCount]uint8
+	PointDeltas                    [cCallOrderCount]uint32
+	CallCounts                     [cSlowPointCount]uint8
+	Task                           [cTaskCommLen]byte
+	File                           [cDnameInlineLen]byte
+	PID                            uint64
+	Delta                          uint64
+	RunOpenTask                    eventRunOpenTaskCStruct
+	OpendataToNFS4State            eventOpendataToNFS4StateCStruct
+	UpdateOpenStateid              eventUpdateOpenStateidCStruct
+	StateMarkReclaimNograceCStruct eventStateMarkReclaimNograceCStruct
+	OrderIndex                     uint32
+	Show                           uint32
+}
+
+type eventRunOpenTaskCStruct struct {
+	EnterOResStateid  eventStateidCStruct
+	ReturnOResStateid eventStateidCStruct
+}
+
+type eventOpendataToNFS4StateCStruct struct {
+	OResStateid eventStateidCStruct
+}
+
+type eventUpdateOpenStateidCStruct struct {
+	OpenStateid eventStateidCStruct
+	State       eventStateCStruct
+}
+
+type eventStateMarkReclaimNograceCStruct struct {
+	EnterState  eventStateCStruct
+	ReturnState eventStateCStruct
+	Executed    uint32
+	Result      uint32
 }
 
 func configNfs4FileOpenTrace(m *bcc.Module) error {
@@ -331,6 +346,25 @@ var fmodeFlags = []string{
 	"FMODE_NOACCOUNT",       // File does not contribute to nr_files count
 }
 
+var clientStates = []string{
+	"NFS4CLNT_MANAGER_RUNNING",
+	"NFS4CLNT_CHECK_LEASE",
+	"NFS4CLNT_LEASE_EXPIRED",
+	"NFS4CLNT_RECLAIM_REBOOT",
+	"NFS4CLNT_RECLAIM_NOGRACE",
+	"NFS4CLNT_DELEGRETURN",
+	"NFS4CLNT_SESSION_RESET",
+	"NFS4CLNT_LEASE_CONFIRM",
+	"NFS4CLNT_SERVER_SCOPE_MISMATCH",
+	"NFS4CLNT_PURGE_STATE",
+	"NFS4CLNT_BIND_CONN_TO_SESSION",
+	"NFS4CLNT_MOVED",
+	"NFS4CLNT_LEASE_MOVED",
+	"NFS4CLNT_DELEGATION_EXPIRED",
+	"NFS4CLNT_RUN_MANAGER",
+	"NFS4CLNT_DELEGRETURN_RUNNING",
+}
+
 func showFlags32(flags uint32, names []string) []string {
 	strs := []string{}
 
@@ -395,6 +429,81 @@ func showFlags64(flags uint64, names []string) []string {
 	return strs
 }
 
+type runOpenTask struct {
+	EnterOResStateid  *stateid
+	ReturnOResStateid *stateid
+}
+
+func newRunOpenTaskFromCStruct(v *eventRunOpenTaskCStruct) *runOpenTask {
+	return &runOpenTask{
+		EnterOResStateid:  newStateidFromCStruct(&v.EnterOResStateid),
+		ReturnOResStateid: newStateidFromCStruct(&v.ReturnOResStateid),
+	}
+}
+
+func (u *runOpenTask) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddObject("enter stateid", u.EnterOResStateid)
+	enc.AddObject("return stateid", u.ReturnOResStateid)
+	return nil
+}
+
+type opendataToNFS4State struct {
+	OResStateid *stateid
+}
+
+func newOpendataToNFS4StateFromCStruct(v *eventOpendataToNFS4StateCStruct) *opendataToNFS4State {
+	return &opendataToNFS4State{
+		OResStateid: newStateidFromCStruct(&v.OResStateid),
+	}
+}
+
+func (u *opendataToNFS4State) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddObject("enter stateid", u.OResStateid)
+	return nil
+}
+
+type updateOpenStateid struct {
+	OpenStateid *stateid
+	State       *state
+}
+
+func newUpdateOpenStateidFromCStruct(v *eventUpdateOpenStateidCStruct) *updateOpenStateid {
+	return &updateOpenStateid{
+		OpenStateid: newStateidFromCStruct(&v.OpenStateid),
+		State:       newStateFromCStruct(&v.State),
+	}
+}
+
+func (u *updateOpenStateid) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddObject("enter open_stateid", u.OpenStateid)
+	enc.AddObject("enter state", u.State)
+	return nil
+}
+
+type stateMarkReclaimNograce struct {
+	EnterState  *state
+	ReturnState *state
+	Executed    bool
+	Result      uint32
+}
+
+func newStateMarkReclaimNograceFromCStruct(v *eventStateMarkReclaimNograceCStruct) *stateMarkReclaimNograce {
+	return &stateMarkReclaimNograce{
+		EnterState:  newStateFromCStruct(&v.EnterState),
+		ReturnState: newStateFromCStruct(&v.ReturnState),
+		Executed:    v.Executed != 0,
+		Result:      v.Result,
+	}
+}
+
+func (u *stateMarkReclaimNograce) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddObject("enter state", u.EnterState)
+	enc.AddObject("return state", u.ReturnState)
+	enc.AddBool("executed", u.Executed)
+	enc.AddUint32("result", u.Result)
+	return nil
+}
+
 type state struct {
 	openStateid *stateid
 	stateid     *stateid
@@ -439,26 +548,6 @@ func (s *state) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	return nil
 }
 
-type eventOpendata struct {
-	stateid *stateid
-}
-
-func (s *eventOpendata) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	enc.AddObject("stateid", s.stateid)
-	return nil
-}
-
-type eventUpdateOpenStateid struct {
-	openStateid *stateid
-	state       *state
-}
-
-func (u *eventUpdateOpenStateid) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	enc.AddObject("openStateid", u.openStateid)
-	enc.AddObject("state", u.state)
-	return nil
-}
-
 type eventNograceState struct {
 	executed bool
 	state    *state
@@ -488,23 +577,19 @@ func (s *optionalStateid) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 }
 
 type eventData struct {
-	ts                   uint64
-	delta                uint32
-	pointIDs             [cCallOrderCount]uint8
-	pointDeltas          [cCallOrderCount]uint32
-	callCounts           [cSlowPointCount]uint8
-	opendata             *eventOpendata
-	enterRuntaskStateid  *stateid
-	returnRuntaskStateid *stateid
-	toStateStateid       *stateid
-	updateOpenStateid    *eventUpdateOpenStateid
-	nograceState         *eventNograceState
-	returnNograceState   *eventNograceState
-	pid                  uint32
-	task                 string
-	file                 string
-	show                 bool
-	returnRuntaskDone    bool
+	ts                      uint64
+	delta                   uint32
+	pointIDs                [cCallOrderCount]uint8
+	pointDeltas             [cCallOrderCount]uint32
+	callCounts              [cSlowPointCount]uint8
+	runOpenTask             *runOpenTask
+	opendataToNFS4State     *opendataToNFS4State
+	updateOpenStateid       *updateOpenStateid
+	stateMarkReclaimNograce *stateMarkReclaimNograce
+	pid                     uint32
+	task                    string
+	file                    string
+	show                    bool
 }
 
 func parseData(data []byte) (*eventData, error) {
@@ -514,33 +599,19 @@ func parseData(data []byte) (*eventData, error) {
 	}
 
 	event := &eventData{
-		ts:          cEvent.Ts,
-		delta:       uint32(cEvent.Delta),
-		pointIDs:    cEvent.PointIDs,
-		pointDeltas: cEvent.PointDeltas,
-		callCounts:  cEvent.CallCounts,
-		opendata: &eventOpendata{
-			stateid: newStateidFromCStruct(&cEvent.OpenStateid),
-		},
-		enterRuntaskStateid:  newStateidFromCStruct(&cEvent.EnterRuntaskStateid),
-		returnRuntaskStateid: newStateidFromCStruct(&cEvent.ReturnRuntaskStateid),
-		toStateStateid:       newStateidFromCStruct(&cEvent.ToStateStateid),
-		updateOpenStateid: &eventUpdateOpenStateid{
-			openStateid: newStateidFromCStruct(&cEvent.OpenStateid),
-			state:       newStateFromCStruct(&cEvent.State),
-		},
-		nograceState: &eventNograceState{
-			executed: cEvent.NograceExecuted != 0,
-			state:    newStateFromCStruct(&cEvent.EnterNograceState),
-		},
-		returnNograceState: &eventNograceState{
-			executed: cEvent.NograceResult != 0,
-			state:    newStateFromCStruct(&cEvent.ReturnNograceState),
-		},
-		pid:  uint32(cEvent.PID),
-		task: cPointerToString(unsafe.Pointer(&cEvent.Task)),
-		file: cPointerToString(unsafe.Pointer(&cEvent.File)),
-		show: cEvent.Show != 0,
+		ts:                      cEvent.Ts,
+		delta:                   uint32(cEvent.Delta),
+		pointIDs:                cEvent.PointIDs,
+		pointDeltas:             cEvent.PointDeltas,
+		callCounts:              cEvent.CallCounts,
+		runOpenTask:             newRunOpenTaskFromCStruct(&cEvent.RunOpenTask),
+		opendataToNFS4State:     newOpendataToNFS4StateFromCStruct(&cEvent.OpendataToNFS4State),
+		updateOpenStateid:       newUpdateOpenStateidFromCStruct(&cEvent.UpdateOpenStateid),
+		stateMarkReclaimNograce: newStateMarkReclaimNograceFromCStruct(&cEvent.StateMarkReclaimNograceCStruct),
+		pid:                     uint32(cEvent.PID),
+		task:                    cPointerToString(unsafe.Pointer(&cEvent.Task)),
+		file:                    cPointerToString(unsafe.Pointer(&cEvent.File)),
+		show:                    cEvent.Show != 0,
 	}
 
 	return event, nil
@@ -596,13 +667,10 @@ func Run(ctx context.Context, config *Config) {
 						}
 						return nil
 					})),
-					zap.Object("nfs4_opendata_alloc() return o_res", evt.opendata),
-					zap.Object("nfs4_run_open_task() enter o_res", evt.enterRuntaskStateid),
-					zap.Object("nfs4_run_open_task() return o_res", evt.returnRuntaskStateid),
-					zap.Object("_nfs4_opendata_to_nfs4_state() enter o_res", evt.toStateStateid),
+					zap.Object("nfs4_run_open_task()", evt.runOpenTask),
+					zap.Object("_nfs4_opendata_to_nfs4_state()", evt.opendataToNFS4State),
 					zap.Object("update_open_stateid()", evt.updateOpenStateid),
-					zap.Object("nfs4_state_mark_reclaim_nograce() enter", evt.nograceState),
-					zap.Object("nfs4_state_mark_reclaim_nograce() return", evt.returnNograceState),
+					zap.Object("nfs4_state_mark_reclaim_nograce()", evt.stateMarkReclaimNograce),
 					zap.Uint32("pid", evt.pid),
 					zap.String("task", evt.task),
 					zap.String("file", evt.file),

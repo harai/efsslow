@@ -77,6 +77,27 @@ struct data_state_t {
   u32 state;
 } __attribute__((__packed__));
 
+struct data_run_open_task_t {
+  struct data_stateid_t enter_o_res_stateid;
+  struct data_stateid_t return_o_res_stateid;
+} __attribute__((__packed__));
+
+struct data_opendata_to_nfs4_state_t {
+  struct data_stateid_t o_res_stateid;
+} __attribute__((__packed__));
+
+struct data_update_open_stateid_t {
+  struct data_stateid_t open_stateid;
+  struct data_state_t state;
+} __attribute__((__packed__));
+
+struct data_state_mark_reclaim_nograce_t {
+  struct data_state_t enter_state;
+  struct data_state_t return_state;
+  u32 executed;
+  u32 result;
+} __attribute__((__packed__));
+
 struct data_t {
   u64 ts;
   u8 point_ids[CALL_ORDER_COUNT];
@@ -86,16 +107,10 @@ struct data_t {
   char file[DNAME_INLINE_LEN];
   u64 pid;
   u64 delta;
-  struct data_stateid_t open_stateid;
-  struct data_stateid_t opendata_stateid;
-  struct data_stateid_t enter_runtask_stateid;
-  struct data_stateid_t return_runtask_stateid;
-  struct data_stateid_t to_state_stateid;
-  struct data_state_t state;
-  struct data_state_t enter_nograce_state;
-  struct data_state_t return_nograce_state;
-  u32 nograce_executed;
-  u32 nograce_result;
+  struct data_run_open_task_t run_open_task;
+  struct data_opendata_to_nfs4_state_t opendata_to_nfs4_state;
+  struct data_update_open_stateid_t update_open_stateid;
+  struct data_state_mark_reclaim_nograce_t state_mark_reclaim_nograce;
   u32 order_index;
   u32 show;
 } __attribute__((__packed__));
@@ -166,10 +181,10 @@ int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file 
   }
 
   // Initialize conditional data
-  data->nograce_executed = 0;
-  data->nograce_result = 0;
-  init_state(&data->enter_nograce_state);
-  init_state(&data->return_nograce_state);
+  data->state_mark_reclaim_nograce.executed = 0;
+  data->state_mark_reclaim_nograce.result = 0;
+  init_state(&data->state_mark_reclaim_nograce.enter_state);
+  init_state(&data->state_mark_reclaim_nograce.return_state);
 
   u64 id = bpf_get_current_pid_tgid();
   entryinfo.update(&id, data);
@@ -248,8 +263,8 @@ static int check_show(struct pt_regs *ctx, u8 point_id) {
     data->show = 1;
   }
 
-  copy_state(&data->return_nograce_state, state);
-  data->nograce_result = ret;
+  copy_state(&data->state_mark_reclaim_nograce.return_state, state);
+  data->state_mark_reclaim_nograce.result = ret;
 
   nfs4_state_mark_reclaim_nograce_state.delete(&id);
   entryinfo.update(&id, data);
@@ -266,24 +281,6 @@ static int check_nfs4_opendata_alloc(struct pt_regs *ctx, u8 point_id) {
   add_data(data, point_id);
   struct nfs4_opendata *opendata = (struct nfs4_opendata *)PT_REGS_RC(ctx);
   if (opendata != NULL) {
-    copy_stateid(&data->opendata_stateid, &opendata->o_res.stateid);
-  }
-
-  entryinfo.update(&id, data);
-  return 0;
-}
-
-static int check_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
-  u64 id = bpf_get_current_pid_tgid();
-  struct data_t *data = entryinfo.lookup(&id);
-  if (data == NULL) {
-    return 0;
-  }
-
-  add_data(data, point_id);
-  struct nfs4_opendata *opendata = (struct nfs4_opendata *)PT_REGS_RC(ctx);
-  if (opendata != NULL) {
-    copy_stateid(&data->opendata_stateid, &opendata->o_res.stateid);
   }
 
   entryinfo.update(&id, data);
@@ -301,7 +298,7 @@ static int check_enter_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
   }
 
   add_data(data, point_id);
-  copy_stateid(&data->enter_runtask_stateid, &opendata->o_res.stateid);
+  copy_stateid(&data->run_open_task.enter_o_res_stateid, &opendata->o_res.stateid);
 
   nfs4_run_open_task_opendata.update(&id, &opendata);
   entryinfo.update(&id, data);
@@ -317,7 +314,7 @@ static int check__nfs4_opendata_to_nfs4_state(struct pt_regs *ctx, u8 point_id,
   }
 
   add_data(data, point_id);
-  copy_stateid(&data->to_state_stateid, &opendata->o_res.stateid);
+  copy_stateid(&data->opendata_to_nfs4_state.o_res_stateid, &opendata->o_res.stateid);
 
   entryinfo.update(&id, data);
   return 0;
@@ -332,8 +329,8 @@ static int check_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, u8 point_i
   }
 
   add_data(data, point_id);
-  copy_state(&data->enter_nograce_state, state);
-  data->nograce_executed = 1;
+  copy_state(&data->state_mark_reclaim_nograce.enter_state, state);
+  data->state_mark_reclaim_nograce.executed = 1;
 
   nfs4_state_mark_reclaim_nograce_state.update(&id, &state);
   entryinfo.update(&id, data);
@@ -354,7 +351,7 @@ static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
   struct nfs4_opendata *opendata = *odpp;
 
   add_data(data, point_id);
-  copy_stateid(&data->return_runtask_stateid, &opendata->o_res.stateid);
+  copy_stateid(&data->run_open_task.return_o_res_stateid, &opendata->o_res.stateid);
 
   nfs4_run_open_task_opendata.delete(&id);
   entryinfo.update(&id, data);
@@ -372,8 +369,8 @@ static int check_update_open_stateid(struct pt_regs *ctx, u8 point_id,
   }
 
   add_data(data, point_id);
-  copy_stateid(&data->open_stateid, open_stateid);
-  copy_state(&data->state, state);
+  copy_stateid(&data->update_open_stateid.open_stateid, open_stateid);
+  copy_state(&data->update_open_stateid.state, state);
   entryinfo.update(&id, data);
   return 0;
 }
@@ -453,7 +450,7 @@ int return__update_open_stateflags(struct pt_regs *ctx) { return check(ctx, 15);
 int return__update_open_stateid(struct pt_regs *ctx) { return check(ctx, 16); }
 int return__nfs4_atomic_open(struct pt_regs *ctx) { return check(ctx, 17); }
 
-int enter__nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx,
+int enter__nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, struct nfs_client *clp,
                                            struct nfs4_state *state) {
   return check_nfs4_state_mark_reclaim_nograce(ctx, 22, state);
 }
