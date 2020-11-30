@@ -77,6 +77,10 @@ struct data_state_t {
   u32 state;
 } __attribute__((__packed__));
 
+struct data_client_t {
+  u64 cl_state;
+} __attribute__((__packed__));
+
 struct data_run_open_task_t {
   struct data_stateid_t enter_o_res_stateid;
   struct data_stateid_t return_o_res_stateid;
@@ -98,6 +102,10 @@ struct data_state_mark_reclaim_nograce_t {
   u32 result;
 } __attribute__((__packed__));
 
+struct data_wait_clnt_recover_t {
+  struct data_client_t client;
+} __attribute__((__packed__));
+
 struct data_t {
   u64 ts;
   u8 point_ids[CALL_ORDER_COUNT];
@@ -111,6 +119,7 @@ struct data_t {
   struct data_opendata_to_nfs4_state_t opendata_to_nfs4_state;
   struct data_update_open_stateid_t update_open_stateid;
   struct data_state_mark_reclaim_nograce_t state_mark_reclaim_nograce;
+  struct data_wait_clnt_recover_t wait_clnt_recover;
   u32 order_index;
   u32 show;
 } __attribute__((__packed__));
@@ -155,6 +164,10 @@ static void init_state(struct data_state_t *state) {
   state->n_wronly = 0;
   state->n_rdonly = 0;
   state->state = 0;
+}
+
+static void copy_client(struct data_client_t *dst, const struct nfs_client *src) {
+  bpf_probe_read_kernel(&dst->cl_state, sizeof(u64), &src->cl_state);
 }
 
 int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
@@ -320,6 +333,21 @@ static int check__nfs4_opendata_to_nfs4_state(struct pt_regs *ctx, u8 point_id,
   return 0;
 }
 
+static int check__nfs4_wait_clnt_recover(struct pt_regs *ctx, u8 point_id,
+                                         struct nfs_client *clp) {
+  u64 id = bpf_get_current_pid_tgid();
+  struct data_t *data = entryinfo.lookup(&id);
+  if (data == NULL) {
+    return 0;
+  }
+
+  add_data(data, point_id);
+  copy_client(&data->wait_clnt_recover.client, clp);
+
+  entryinfo.update(&id, data);
+  return 0;
+}
+
 static int check_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, u8 point_id,
                                                  struct nfs4_state *state) {
   u64 id = bpf_get_current_pid_tgid();
@@ -380,7 +408,9 @@ int enter__nfs4_atomic_open(struct pt_regs *ctx) { return check(ctx, 0); }
 int enter__nfs4_client_recover_expired_lease(struct pt_regs *ctx) {
   return check(ctx, 1);
 }
-int enter__nfs4_wait_clnt_recover(struct pt_regs *ctx) { return check(ctx, 2); }
+int enter__nfs4_wait_clnt_recover(struct pt_regs *ctx, struct nfs_client *clp) {
+  return check__nfs4_wait_clnt_recover(ctx, 2, clp);
+}
 // int enter__prepare_to_wait(struct pt_regs *ctx)
 // int return__prepare_to_wait(struct pt_regs *ctx)
 int enter__nfs_wait_bit_killable(struct pt_regs *ctx) { return check(ctx, 18); }
