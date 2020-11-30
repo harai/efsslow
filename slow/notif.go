@@ -73,40 +73,37 @@ type eventStateidCStruct struct {
 	Type  uint32
 }
 
+type eventStateCStruct struct {
+	OpenStateid eventStateidCStruct
+	Stateid     eventStateidCStruct
+	Flags       uint64
+	NRdonly     uint32
+	NWronly     uint32
+	NRdwr       uint32
+	State       uint32
+}
+
 type eventCStruct struct {
-	Ts                        uint64
-	PointIDs                  [cCallOrderCount]uint8
-	PointDeltas               [cCallOrderCount]uint32
-	CallCounts                [cSlowPointCount]uint8
-	Task                      [cTaskCommLen]byte
-	File                      [cDnameInlineLen]byte
-	PID                       uint64
-	Delta                     uint64
-	OpenStateid               eventStateidCStruct
-	StateOpenStateid          eventStateidCStruct
-	StateStateid              eventStateidCStruct
-	OpendataStateid           eventStateidCStruct
-	EnterRuntaskStateid       eventStateidCStruct
-	ReturnRuntaskStateid      eventStateidCStruct
-	ToStateStateid            eventStateidCStruct
-	StateFlags                uint64
-	NograceStateFlags         uint64
-	ReturnNograceStateFlags   uint64
-	StateClientSession        uint64
-	StateNRdonly              uint32
-	StateNWronly              uint32
-	StateNRdwr                uint32
-	NograceExecuted           uint32
-	NograceStateNRdonly       uint32
-	NograceStateNWronly       uint32
-	NograceStateNRdwr         uint32
-	ReturnNograceExecuted     uint32
-	ReturnNograceStateNRdonly uint32
-	ReturnNograceStateNWronly uint32
-	ReturnNograceStateNRdwr   uint32
-	StateState                uint32
-	OrderIndex                uint32
-	Show                      uint32
+	Ts                   uint64
+	PointIDs             [cCallOrderCount]uint8
+	PointDeltas          [cCallOrderCount]uint32
+	CallCounts           [cSlowPointCount]uint8
+	Task                 [cTaskCommLen]byte
+	File                 [cDnameInlineLen]byte
+	PID                  uint64
+	Delta                uint64
+	OpenStateid          eventStateidCStruct
+	OpendataStateid      eventStateidCStruct
+	EnterRuntaskStateid  eventStateidCStruct
+	ReturnRuntaskStateid eventStateidCStruct
+	ToStateStateid       eventStateidCStruct
+	State                eventStateCStruct
+	EnterNograceState    eventStateCStruct
+	ReturnNograceState   eventStateCStruct
+	NograceExecuted      uint32
+	NograceResult        uint32
+	OrderIndex           uint32
+	Show                 uint32
 }
 
 func configNfs4FileOpenTrace(m *bcc.Module) error {
@@ -398,18 +395,29 @@ func showFlags64(flags uint64, names []string) []string {
 	return strs
 }
 
-type eventState struct {
-	openStateid   *stateid
-	stateid       *stateid
-	flags         uint64
-	nRdonly       uint32
-	nWronly       uint32
-	nRdwr         uint32
-	state         uint32
-	clientSession uint64
+type state struct {
+	openStateid *stateid
+	stateid     *stateid
+	flags       uint64
+	nRdonly     uint32
+	nWronly     uint32
+	nRdwr       uint32
+	state       uint32
 }
 
-func (s *eventState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+func newStateFromCStruct(v *eventStateCStruct) *state {
+	return &state{
+		openStateid: newStateidFromCStruct(&v.OpenStateid),
+		stateid:     newStateidFromCStruct(&v.Stateid),
+		flags:       v.Flags,
+		nRdonly:     v.NRdonly,
+		nWronly:     v.NWronly,
+		nRdwr:       v.NRdwr,
+		state:       v.State,
+	}
+}
+
+func (s *state) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddObject("openStateid", s.openStateid)
 	enc.AddObject("stateid", s.stateid)
 	enc.AddArray("flags", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
@@ -422,7 +430,6 @@ func (s *eventState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddUint32("n_rdonly", s.nRdonly)
 	enc.AddUint32("n_wronly", s.nWronly)
 	enc.AddUint32("n_rdwr", s.nRdwr)
-	enc.AddUint64("((struct nfs_server *)(inode->i_sb->s_fs_info))->nfs_client->cl_session", s.clientSession)
 	enc.AddArray("state", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
 		for _, f := range showFlags32(s.state, fmodeFlags) {
 			inner.AppendString(f)
@@ -443,7 +450,7 @@ func (s *eventOpendata) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 
 type eventUpdateOpenStateid struct {
 	openStateid *stateid
-	state       *eventState
+	state       *state
 }
 
 func (u *eventUpdateOpenStateid) MarshalLogObject(enc zapcore.ObjectEncoder) error {
@@ -454,24 +461,12 @@ func (u *eventUpdateOpenStateid) MarshalLogObject(enc zapcore.ObjectEncoder) err
 
 type eventNograceState struct {
 	executed bool
-	flags    uint64
-	nRdonly  uint32
-	nWronly  uint32
-	nRdwr    uint32
+	state    *state
 }
 
 func (n *eventNograceState) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddBool("executed", n.executed)
-	enc.AddArray("flags", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
-		for _, f := range showFlags64(n.flags, stateFlags) {
-			inner.AppendString(f)
-		}
-		return nil
-	}))
-	enc.AddUint64("flags(num)", n.flags)
-	enc.AddUint32("n_rdonly", n.nRdonly)
-	enc.AddUint32("n_wronly", n.nWronly)
-	enc.AddUint32("n_rdwr", n.nRdwr)
+	enc.AddObject("state", n.state)
 	return nil
 }
 
@@ -532,30 +527,15 @@ func parseData(data []byte) (*eventData, error) {
 		toStateStateid:       newStateidFromCStruct(&cEvent.ToStateStateid),
 		updateOpenStateid: &eventUpdateOpenStateid{
 			openStateid: newStateidFromCStruct(&cEvent.OpenStateid),
-			state: &eventState{
-				openStateid:   newStateidFromCStruct(&cEvent.StateOpenStateid),
-				stateid:       newStateidFromCStruct(&cEvent.StateStateid),
-				flags:         cEvent.StateFlags,
-				nRdonly:       cEvent.StateNRdonly,
-				nWronly:       cEvent.StateNWronly,
-				nRdwr:         cEvent.StateNRdwr,
-				state:         cEvent.StateState,
-				clientSession: cEvent.StateClientSession,
-			},
+			state:       newStateFromCStruct(&cEvent.State),
 		},
 		nograceState: &eventNograceState{
 			executed: cEvent.NograceExecuted != 0,
-			flags:    cEvent.NograceStateFlags,
-			nRdonly:  cEvent.NograceStateNRdonly,
-			nWronly:  cEvent.NograceStateNWronly,
-			nRdwr:    cEvent.NograceStateNRdwr,
+			state:    newStateFromCStruct(&cEvent.EnterNograceState),
 		},
 		returnNograceState: &eventNograceState{
-			executed: cEvent.ReturnNograceExecuted != 0,
-			flags:    cEvent.ReturnNograceStateFlags,
-			nRdonly:  cEvent.ReturnNograceStateNRdonly,
-			nWronly:  cEvent.ReturnNograceStateNWronly,
-			nRdwr:    cEvent.ReturnNograceStateNRdwr,
+			executed: cEvent.NograceResult != 0,
+			state:    newStateFromCStruct(&cEvent.ReturnNograceState),
 		},
 		pid:  uint32(cEvent.PID),
 		task: cPointerToString(unsafe.Pointer(&cEvent.Task)),

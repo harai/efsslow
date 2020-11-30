@@ -67,6 +67,16 @@ struct data_stateid_t {
   u32 type;
 } __attribute__((__packed__));
 
+struct data_state_t {
+  struct data_stateid_t open_stateid;
+  struct data_stateid_t stateid;
+  u64 flags;
+  u32 n_rdonly;
+  u32 n_wronly;
+  u32 n_rdwr;
+  u32 state;
+} __attribute__((__packed__));
+
 struct data_t {
   u64 ts;
   u8 point_ids[CALL_ORDER_COUNT];
@@ -77,28 +87,15 @@ struct data_t {
   u64 pid;
   u64 delta;
   struct data_stateid_t open_stateid;
-  struct data_stateid_t state_open_stateid;
-  struct data_stateid_t state_stateid;
   struct data_stateid_t opendata_stateid;
   struct data_stateid_t enter_runtask_stateid;
   struct data_stateid_t return_runtask_stateid;
   struct data_stateid_t to_state_stateid;
-  u64 state_flags;
-  u64 nograce_state_flags;
-  u64 return_nograce_state_flags;
-  u64 state_client_session;
-  u32 state_n_rdonly;
-  u32 state_n_wronly;
-  u32 state_n_rdwr;
+  struct data_state_t state;
+  struct data_state_t enter_nograce_state;
+  struct data_state_t return_nograce_state;
   u32 nograce_executed;
-  u32 nograce_state_n_rdonly;
-  u32 nograce_state_n_wronly;
-  u32 nograce_state_n_rdwr;
-  u32 return_nograce_executed;
-  u32 return_nograce_state_n_rdonly;
-  u32 return_nograce_state_n_wronly;
-  u32 return_nograce_state_n_rdwr;
-  u32 state_state;
+  u32 nograce_result;
   u32 order_index;
   u32 show;
 } __attribute__((__packed__));
@@ -111,6 +108,38 @@ static void copy_stateid(struct data_stateid_t *dst, const nfs4_stateid *src) {
   bpf_probe_read_kernel(dst->seqid, 4, (char *)(&src->seqid));
   bpf_probe_read_kernel(dst->other, NFS4_STATEID_OTHER_SIZE, src->other);
   bpf_probe_read_kernel(&dst->type, sizeof(u32), &src->type);
+}
+
+static void init_stateid(struct data_stateid_t *stateid) {
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    stateid->seqid[i] = 0;
+  }
+#pragma unroll
+  for (int i = 0; i < NFS4_STATEID_OTHER_SIZE; i++) {
+    stateid->other[i] = 0;
+  }
+  stateid->type = 0;
+}
+
+static void copy_state(struct data_state_t *dst, const struct nfs4_state *src) {
+  copy_stateid(&dst->open_stateid, &src->open_stateid);
+  copy_stateid(&dst->stateid, &src->stateid);
+  bpf_probe_read_kernel(&dst->flags, sizeof(u64), &src->flags);
+  bpf_probe_read_kernel(&dst->n_rdwr, sizeof(u32), &src->n_rdwr);
+  bpf_probe_read_kernel(&dst->n_wronly, sizeof(u32), &src->n_wronly);
+  bpf_probe_read_kernel(&dst->n_rdonly, sizeof(u32), &src->n_rdonly);
+  bpf_probe_read_kernel(&dst->state, sizeof(u32), &src->state);
+}
+
+static void init_state(struct data_state_t *state) {
+  init_stateid(&state->open_stateid);
+  init_stateid(&state->stateid);
+  state->flags = 0;
+  state->n_rdwr = 0;
+  state->n_wronly = 0;
+  state->n_rdonly = 0;
+  state->state = 0;
 }
 
 int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
@@ -138,15 +167,9 @@ int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file 
 
   // Initialize conditional data
   data->nograce_executed = 0;
-  data->nograce_state_flags = 0;
-  data->nograce_state_n_rdonly = 0;
-  data->nograce_state_n_wronly = 0;
-  data->nograce_state_n_rdwr = 0;
-  data->return_nograce_executed = 0;
-  data->return_nograce_state_flags = 0;
-  data->return_nograce_state_n_rdonly = 0;
-  data->return_nograce_state_n_wronly = 0;
-  data->return_nograce_state_n_rdwr = 0;
+  data->nograce_result = 0;
+  init_state(&data->enter_nograce_state);
+  init_state(&data->return_nograce_state);
 
   u64 id = bpf_get_current_pid_tgid();
   entryinfo.update(&id, data);
@@ -225,13 +248,8 @@ static int check_show(struct pt_regs *ctx, u8 point_id) {
     data->show = 1;
   }
 
-  bpf_probe_read_kernel(&data->return_nograce_state_flags, sizeof(u64), &state->flags);
-  bpf_probe_read_kernel(&data->return_nograce_state_n_rdonly, sizeof(u32),
-                        &state->n_rdonly);
-  bpf_probe_read_kernel(&data->return_nograce_state_n_wronly, sizeof(u32),
-                        &state->n_wronly);
-  bpf_probe_read_kernel(&data->return_nograce_state_n_rdwr, sizeof(u32), &state->n_rdwr);
-  data->return_nograce_executed = 1;
+  copy_state(&data->return_nograce_state, state);
+  data->nograce_result = ret;
 
   nfs4_state_mark_reclaim_nograce_state.delete(&id);
   entryinfo.update(&id, data);
@@ -314,10 +332,7 @@ static int check_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, u8 point_i
   }
 
   add_data(data, point_id);
-  bpf_probe_read_kernel(&data->nograce_state_flags, sizeof(u64), &state->flags);
-  bpf_probe_read_kernel(&data->nograce_state_n_rdonly, sizeof(u32), &state->n_rdonly);
-  bpf_probe_read_kernel(&data->nograce_state_n_wronly, sizeof(u32), &state->n_wronly);
-  bpf_probe_read_kernel(&data->nograce_state_n_rdwr, sizeof(u32), &state->n_rdwr);
+  copy_state(&data->enter_nograce_state, state);
   data->nograce_executed = 1;
 
   nfs4_state_mark_reclaim_nograce_state.update(&id, &state);
@@ -358,16 +373,7 @@ static int check_update_open_stateid(struct pt_regs *ctx, u8 point_id,
 
   add_data(data, point_id);
   copy_stateid(&data->open_stateid, open_stateid);
-  copy_stateid(&data->state_open_stateid, &state->open_stateid);
-  copy_stateid(&data->state_stateid, &state->stateid);
-  bpf_probe_read_kernel(&data->state_flags, sizeof(u64), &state->flags);
-  bpf_probe_read_kernel(&data->state_n_rdwr, sizeof(u32), &state->n_rdwr);
-  bpf_probe_read_kernel(&data->state_n_wronly, sizeof(u32), &state->n_wronly);
-  bpf_probe_read_kernel(&data->state_n_rdonly, sizeof(u32), &state->n_rdonly);
-  bpf_probe_read_kernel(&data->state_state, sizeof(u32), &state->state);
-  bpf_probe_read_kernel(
-      &data->state_client_session, sizeof(u64),
-      &((struct nfs_server *)(state->inode->i_sb->s_fs_info))->nfs_client->cl_session);
+  copy_state(&data->state, state);
   entryinfo.update(&id, data);
   return 0;
 }
