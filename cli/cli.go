@@ -9,12 +9,29 @@ import (
 	"github.com/harai/efsslow/slow"
 	"github.com/urfave/cli/v2"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 func createLogger() *zap.Logger {
-	log, err := zap.NewDevelopment(zap.WithCaller(false))
+	log, err := zap.Config{
+		Level:         zap.NewAtomicLevelAt(zap.DebugLevel),
+		Development:   true,
+		DisableCaller: true,
+		Encoding:      "json",
+		EncoderConfig: zapcore.EncoderConfig{
+			LevelKey:       "level",
+			MessageKey:     "message",
+			LineEnding:     zapcore.DefaultLineEnding,
+			EncodeLevel:    zapcore.CapitalLevelEncoder,
+			EncodeTime:     zapcore.ISO8601TimeEncoder,
+			EncodeDuration: zapcore.StringDurationEncoder,
+			EncodeCaller:   zapcore.ShortCallerEncoder,
+		},
+		OutputPaths:      []string{"stderr"},
+		ErrorOutputPaths: []string{"stderr"},
+	}.Build()
 	if err != nil {
-		panic("failed to initialize logger")
+		panic(err)
 	}
 
 	return log
@@ -31,6 +48,18 @@ func main() {
 			Aliases: []string{"t"},
 			Value:   100,
 			Usage:   "Slow threshold",
+		},
+		&cli.UintFlag{
+			Name:    "sample-ratio",
+			Aliases: []string{"r"},
+			Value:   1000,
+			Usage:   "Random sampling ratio",
+		},
+		&cli.StringFlag{
+			Name:    "file-name",
+			Aliases: []string{"f"},
+			Value:   "",
+			Usage:   "Traces which contain this file name are always shown.",
 		},
 		&cli.UintFlag{
 			Name:  "bpf-debug",
@@ -55,7 +84,9 @@ func main() {
 
 		cfg := &slow.Config{
 			SlowThresholdMS: c.Uint("slow-threshold-ms"),
+			SampleRatio:     c.Uint("sample-ratio"),
 			BpfDebug:        c.Uint("bpf-debug"),
+			FileName:        c.String("file-name"),
 			Debug:           c.Bool("debug"),
 			Quit:            c.Bool("quit"),
 			Log:             log,

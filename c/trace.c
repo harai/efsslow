@@ -7,6 +7,7 @@
 #include <uapi/linux/ptrace.h>
 
 #define SLOW_THRESHOLD_MS /*SLOW_THRESHOLD_MS*/
+#define SAMPLE_RATIO      /*SAMPLE_RATIO*/
 #define SLOW_POINT_COUNT 48
 #define CALL_ORDER_COUNT 128
 
@@ -61,6 +62,19 @@ struct nfs4_opendata {
   int rpc_status;
 };
 
+enum {
+  EFSS_OUTPUT_SAMPLE = 0,
+  EFSS_OUTPUT_SLOW,
+  EFSS_OUTPUT_SEQID,
+  EFSS_OUTPUT_RECLAIM_NOGRACE,
+  EFSS_OUTPUT_FILE,
+};
+
+struct data_fh_t {
+  u8 size;
+  char data[NFS_MAXFHSIZE];
+} __attribute__((__packed__));
+
 struct data_stateid_t {
   char seqid[4];
   char other[NFS4_STATEID_OTHER_SIZE];
@@ -82,7 +96,7 @@ struct data_client_t {
 } __attribute__((__packed__));
 
 struct data_run_open_task_t {
-  struct data_stateid_t enter_o_res_stateid;
+  struct data_fh_t enter_o_arg_fh;
   struct data_stateid_t return_o_res_stateid;
 } __attribute__((__packed__));
 
@@ -121,12 +135,17 @@ struct data_t {
   struct data_state_mark_reclaim_nograce_t state_mark_reclaim_nograce;
   struct data_wait_clnt_recover_t wait_clnt_recover;
   u32 order_index;
-  u32 show;
+  u32 reason;
 } __attribute__((__packed__));
 
 BPF_PERCPU_ARRAY(store, struct data_t, 1);
 BPF_HASH(entryinfo, u64, struct data_t);
 BPF_PERF_OUTPUT(events);
+
+static void copy_fh(struct data_fh_t *dst, const struct nfs_fh *src) {
+  bpf_probe_read_kernel(&dst->size, 1, &src->size);
+  bpf_probe_read_kernel(dst->data, NFS_MAXFHSIZE, src->data);
+}
 
 static void copy_stateid(struct data_stateid_t *dst, const nfs4_stateid *src) {
   bpf_probe_read_kernel(dst->seqid, 4, (char *)(&src->seqid));
@@ -170,6 +189,25 @@ static void copy_client(struct data_client_t *dst, const struct nfs_client *src)
   bpf_probe_read_kernel(&dst->cl_state, sizeof(u64), &src->cl_state);
 }
 
+static int followed_file(const char d_iname[]) {
+  char name[] = "/*FILE_NAME*/";
+
+  if (name[0] == '\0') {
+    return 0;
+  }
+
+#pragma unroll
+  for (int i = 0; i < DNAME_INLINE_LEN; i++) {
+    if (name[i] != d_iname[i]) {
+      return 0;
+    }
+    if (name[i] == '\0') {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file *filp) {
   int zero = 0;
   struct data_t *data = store.lookup(&zero);
@@ -178,9 +216,12 @@ int enter__nfs4_file_open(struct pt_regs *ctx, struct inode *inode, struct file 
   }
 
   data->order_index = 0;
-  data->show = 0;
+  data->reason = 0x0;
   data->ts = bpf_ktime_get_ns() / 1000;
   bpf_probe_read_kernel(data->file, DNAME_INLINE_LEN, filp->f_path.dentry->d_iname);
+  if (followed_file(data->file)) {
+    data->reason |= 1 << EFSS_OUTPUT_FILE;
+  }
 
 #pragma unroll
   for (int i = 0; i < SLOW_POINT_COUNT; i++) {
@@ -214,12 +255,17 @@ int return__nfs4_file_open(struct pt_regs *ctx) {
   entryinfo.delete(&id);
 
   data->pid = id >> 32;
-
   data->delta = bpf_ktime_get_ns() / 1000 - data->ts;
-  // if (data->delta < SLOW_THRESHOLD_MS * 1000 && !data->show) {
-  //   return 0;
-  // }
-  if (!(data->show || bpf_get_prandom_u32() % 1000 == 0)) {
+
+  if (SLOW_THRESHOLD_MS * 1000 <= data->delta) {
+    data->reason |= 1 << EFSS_OUTPUT_SLOW;
+  }
+
+  if (bpf_get_prandom_u32() % SAMPLE_RATIO == 0) {
+    data->reason |= 1 << EFSS_OUTPUT_SAMPLE;
+  }
+
+  if (data->reason == 0x0) {
     return 0;
   }
 
@@ -257,7 +303,8 @@ static int check(struct pt_regs *ctx, u8 point_id) {
 
 BPF_HASH(nfs4_state_mark_reclaim_nograce_state, u64, struct nfs4_state *);
 
-static int check_show(struct pt_regs *ctx, u8 point_id) {
+static int check_return_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx,
+                                                        u8 point_id) {
   u64 id = bpf_get_current_pid_tgid();
   struct data_t *data = entryinfo.lookup(&id);
   if (data == NULL) {
@@ -273,7 +320,7 @@ static int check_show(struct pt_regs *ctx, u8 point_id) {
   add_data(data, point_id);
   int ret = PT_REGS_RC(ctx);
   if (ret == 1) {
-    data->show = 1;
+    data->reason |= 1 << EFSS_OUTPUT_RECLAIM_NOGRACE;
   }
 
   copy_state(&data->state_mark_reclaim_nograce.return_state, state);
@@ -311,7 +358,7 @@ static int check_enter_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
   }
 
   add_data(data, point_id);
-  copy_stateid(&data->run_open_task.enter_o_res_stateid, &opendata->o_res.stateid);
+  copy_fh(&data->run_open_task.enter_o_arg_fh, opendata->o_arg.fh);
 
   nfs4_run_open_task_opendata.update(&id, &opendata);
   entryinfo.update(&id, data);
@@ -348,8 +395,8 @@ static int check__nfs4_wait_clnt_recover(struct pt_regs *ctx, u8 point_id,
   return 0;
 }
 
-static int check_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, u8 point_id,
-                                                 struct nfs4_state *state) {
+static int check_enter_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, u8 point_id,
+                                                       struct nfs4_state *state) {
   u64 id = bpf_get_current_pid_tgid();
   struct data_t *data = entryinfo.lookup(&id);
   if (data == NULL) {
@@ -363,6 +410,15 @@ static int check_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, u8 point_i
   nfs4_state_mark_reclaim_nograce_state.update(&id, &state);
   entryinfo.update(&id, data);
   return 0;
+}
+
+static u32 fix_seqid_endianness(char seqid[4]) {
+  u32 ret = 0;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    ret |= seqid[i] << (i * 8);
+  }
+  return ret;
 }
 
 static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
@@ -380,6 +436,9 @@ static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
 
   add_data(data, point_id);
   copy_stateid(&data->run_open_task.return_o_res_stateid, &opendata->o_res.stateid);
+  if (1 < fix_seqid_endianness(data->run_open_task.return_o_res_stateid.seqid)) {
+    data->reason |= 1 << EFSS_OUTPUT_SEQID;
+  }
 
   nfs4_run_open_task_opendata.delete(&id);
   entryinfo.update(&id, data);
@@ -438,12 +497,8 @@ int return__nfs4_run_open_task(struct pt_regs *ctx) {
   return check_return_nfs4_run_open_task(ctx, 31);
 }
 
-int enter___nfs4_proc_open_confirm(struct pt_regs *ctx, struct nfs4_opendata *data) {
-  return check(ctx, 34);
-}
-int return___nfs4_proc_open_confirm(struct pt_regs *ctx, struct nfs4_opendata *data) {
-  return check(ctx, 35);
-}
+int enter___nfs4_proc_open_confirm(struct pt_regs *ctx) { return check(ctx, 34); }
+int return___nfs4_proc_open_confirm(struct pt_regs *ctx) { return check(ctx, 35); }
 
 int enter___nfs4_opendata_to_nfs4_state(struct pt_regs *ctx, struct nfs4_opendata *data) {
   return check__nfs4_opendata_to_nfs4_state(ctx, 32, data);
@@ -482,8 +537,8 @@ int return__nfs4_atomic_open(struct pt_regs *ctx) { return check(ctx, 17); }
 
 int enter__nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, struct nfs_client *clp,
                                            struct nfs4_state *state) {
-  return check_nfs4_state_mark_reclaim_nograce(ctx, 22, state);
+  return check_enter_nfs4_state_mark_reclaim_nograce(ctx, 22, state);
 }
 int return__nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx) {
-  return check_show(ctx, 23);
+  return check_return_nfs4_state_mark_reclaim_nograce(ctx, 23);
 }

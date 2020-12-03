@@ -34,11 +34,14 @@ const (
 	cCallOrderCount       = 128
 	cDnameInlineLen       = 32
 	cNFS4StateidOtherSize = 12
+	cNFSMaxFHSize         = 128
 )
 
 // Config configures parameters to filter what to be notified.
 type Config struct {
 	SlowThresholdMS uint
+	SampleRatio     uint
+	FileName        string
 	BpfDebug        uint
 	Debug           bool
 	Quit            bool
@@ -127,6 +130,7 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	addPoint(m, "nfs4_get_open_state")
 	addPoint(m, "__nfs4_find_state_byowner")
 	addPoint(m, "update_open_stateid")
+	addPoint(m, "nfs_state_log_update_open_stateid")
 	addPoint(m, "prepare_to_wait")
 	addPoint(m, "finish_wait")
 	addPoint(m, "nfs4_state_mark_reclaim_nograce")
@@ -172,6 +176,8 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 	//                      update_open_stateid (Conditional)
 	//                          nfs_state_set_open_stateid (N/S)
 	//                              nfs_set_open_stateid_locked (N/S)
+	//                                  nfs_need_update_open_stateid (N/S)
+	//                                      nfs_state_log_update_open_stateid (Conditional)
 	//                                  prepare_to_wait
 	//                                  finish_wait
 	//                                  nfs_test_and_clear_all_open_stateid (Conditional, N/S)
@@ -198,10 +204,15 @@ func configTrace(m *bcc.Module, receiverChan chan []byte) *bcc.PerfMap {
 }
 
 func generateSource(config *Config) string {
-	return strings.Replace(
-		source,
+	rep := strings.NewReplacer(
 		"/*SLOW_THRESHOLD_MS*/",
-		strconv.FormatUint(uint64(config.SlowThresholdMS), 10), -1)
+		strconv.FormatUint(uint64(config.SlowThresholdMS), 10),
+		"/*SAMPLE_RATIO*/",
+		strconv.FormatUint(uint64(config.SampleRatio), 10),
+		"/*FILE_NAME*/",
+		config.FileName,
+	)
+	return rep.Replace(source)
 }
 
 var stateFlags = []string{
@@ -218,6 +229,14 @@ var stateFlags = []string{
 	"NFS_STATE_MAY_NOTIFY_LOCK",   // server may CB_NOTIFY_LOCK
 	"NFS_STATE_CHANGE_WAIT",       // A state changing operation is outstanding
 	"NFS_CLNT_DST_SSC_COPY_STATE", // dst server open state on client*/
+}
+
+var outputReasonFlags = []string{
+	"EFSS_OUTPUT_SAMPLE",
+	"EFSS_OUTPUT_SLOW",
+	"EFSS_OUTPUT_SEQID",
+	"EFSS_OUTPUT_RECLAIM_NOGRACE",
+	"EFSS_OUTPUT_FILE",
 }
 
 var fmodeFlags = []string{
@@ -332,6 +351,16 @@ func showFlags64(flags uint64, names []string) []string {
 	return strs
 }
 
+type fh struct {
+	Size uint8
+	Data [cNFSMaxFHSize]byte
+}
+
+func (h *fh) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddString("asHex", "0x"+hex.EncodeToString(h.Data[:h.Size]))
+	return nil
+}
+
 type stateid struct {
 	Seqid [4]byte
 	Other [cNFS4StateidOtherSize]byte
@@ -427,11 +456,11 @@ type eventCStruct struct {
 	StateMarkReclaimNograce stateMarkReclaimNograce
 	WaitClntRecover         waitClntRecover
 	OrderIndex              uint32
-	Show                    uint32
+	Reason                  uint32
 }
 
 type runOpenTask struct {
-	EnterOResStateid  stateid
+	EnterOArgFH       fh
 	ReturnOResStateid stateid
 }
 
@@ -456,7 +485,7 @@ type waitClntRecover struct {
 }
 
 func (u *runOpenTask) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	enc.AddObject("enter stateid", &u.EnterOResStateid)
+	enc.AddObject("enter fh", &u.EnterOArgFH)
 	enc.AddObject("return stateid", &u.ReturnOResStateid)
 	return nil
 }
@@ -498,10 +527,13 @@ func parseData(data []byte) (*eventCStruct, error) {
 	return &cEvent, nil
 }
 
-func outputDebug(evt *eventCStruct) {
+func outputDebug(evt *eventCStruct, now *time.Time) {
+	delta := time.Duration(evt.Delta) * time.Microsecond
+
 	log.Debug(
 		"event",
-		zap.Duration("delta", time.Duration(evt.Delta)*time.Microsecond),
+		zap.Time("time", now.Add(-delta)),
+		zap.Duration("delta", delta),
 		zap.Array("points", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
 			for i, id := range evt.PointIDs {
 				inner.AppendObject(zapcore.ObjectMarshalerFunc(func(inner2 zapcore.ObjectEncoder) error {
@@ -527,7 +559,12 @@ func outputDebug(evt *eventCStruct) {
 		zap.Uint32("pid", uint32(evt.PID)),
 		zap.String("task", cPointerToString(unsafe.Pointer(&evt.Task))),
 		zap.String("file", cPointerToString(unsafe.Pointer(&evt.File))),
-		zap.Bool("show", evt.Show != 0),
+		zap.Array("reason", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+			for _, f := range showFlags32(evt.Reason, outputReasonFlags) {
+				inner.AppendString(f)
+			}
+			return nil
+		})),
 	)
 }
 
@@ -538,14 +575,14 @@ func Run(ctx context.Context, config *Config) {
 	if config.Debug {
 		fmt.Fprintln(os.Stderr, source)
 	}
-	m := bcc.NewModule(generateSource(config), []string{}, config.BpfDebug)
+	m := bcc.NewModule(source, []string{}, config.BpfDebug)
 	defer m.Close()
 
 	if config.Quit {
 		return
 	}
 
-	channel := make(chan []byte, 8192)
+	channel := make(chan []byte, 65536)
 	perfMap := configTrace(m, channel)
 
 	go func() {
@@ -555,13 +592,14 @@ func Run(ctx context.Context, config *Config) {
 			case <-ctx.Done():
 				return
 			case data := <-channel:
+				now := time.Now()
 				evt, err := parseData(data)
 				if err != nil {
-					fmt.Printf("failed to decode received data: %s\n", err)
+					log.Error("failed to decode received data", zap.Error(err))
 					continue
 				}
 
-				outputDebug(evt)
+				outputDebug(evt, &now)
 			}
 		}
 	}()
