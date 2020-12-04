@@ -287,6 +287,32 @@ var clientStates = []string{
 	"NFS4CLNT_DELEGRETURN_RUNNING",
 }
 
+var claims = []string{
+	"NFS4_OPEN_CLAIM_NULL",
+	"NFS4_OPEN_CLAIM_PREVIOUS",
+	"NFS4_OPEN_CLAIM_DELEGATE_CUR",
+	"NFS4_OPEN_CLAIM_DELEGATE_PREV",
+	"NFS4_OPEN_CLAIM_FH",
+	"NFS4_OPEN_CLAIM_DELEG_CUR_FH",
+	"NFS4_OPEN_CLAIM_DELEG_PREV_FH",
+}
+
+var shareAccesses = []string{
+	"",
+	"NFS4_SHARE_ACCESS_READ",
+	"NFS4_SHARE_ACCESS_WRITE",
+	"NFS4_SHARE_ACCESS_BOTH",
+}
+
+var shareAccessWants = []string{
+	"NFS4_SHARE_WANT_NO_PREFERENCE",
+	"NFS4_SHARE_WANT_READ_DELEG",
+	"NFS4_SHARE_WANT_WRITE_DELEG",
+	"NFS4_SHARE_WANT_ANY_DELEG",
+	"NFS4_SHARE_WANT_NO_DELEG",
+	"NFS4_SHARE_WANT_CANCEL",
+}
+
 func showFlags32(flags uint32, names []string) []string {
 	strs := []string{}
 
@@ -460,8 +486,10 @@ type eventCStruct struct {
 }
 
 type runOpenTask struct {
-	EnterOArgFH       fh
-	ReturnOResStateid stateid
+	EnterOArgFH          fh
+	EnterOArgShareAccess uint32
+	EnterOArgClaim       uint8
+	ReturnOResStateid    stateid
 }
 
 type opendataToNFS4State struct {
@@ -484,8 +512,46 @@ type waitClntRecover struct {
 	Client client
 }
 
+func (u *runOpenTask) shareAccessValues() []string {
+	values := []string{}
+
+	access := u.EnterOArgShareAccess & 0x0000000f
+	if int(access) < len(shareAccesses) && shareAccesses[access] != "" {
+		values = append(values, shareAccesses[access])
+	} else {
+		log.Warn("unknown share_access lower 4 bits", zap.Uint32("4bits", access))
+		values = append(values, "UNKNOWN LOWER 4 BITS: "+strconv.Itoa(int(access)))
+	}
+
+	want := (u.EnterOArgShareAccess & 0x0000ff00) >> 8
+	if int(want) < len(shareAccessWants) && shareAccessWants[want] != "" {
+		values = append(values, shareAccessWants[want])
+	} else {
+		log.Warn("unknown share_access middle 8 bits", zap.Uint32("8bits", want))
+		values = append(values, "UNKNOWN MIDDLE 8 BITS: "+strconv.Itoa(int(want)))
+	}
+
+	return values
+}
+
+func (u *runOpenTask) claimValue() string {
+	if int(u.EnterOArgClaim) < len(claims) {
+		return claims[u.EnterOArgClaim]
+	}
+
+	log.Warn("unknown claim value", zap.Uint8("value", u.EnterOArgClaim))
+	return "UNKNOWN VALUE: " + strconv.Itoa(int(u.EnterOArgClaim))
+}
+
 func (u *runOpenTask) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddObject("enter fh", &u.EnterOArgFH)
+	enc.AddArray("enter share_access", zapcore.ArrayMarshalerFunc(func(inner zapcore.ArrayEncoder) error {
+		for _, v := range u.shareAccessValues() {
+			inner.AppendString(v)
+		}
+		return nil
+	}))
+	enc.AddString("enter claim", u.claimValue())
 	enc.AddObject("return stateid", &u.ReturnOResStateid)
 	return nil
 }

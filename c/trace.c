@@ -97,6 +97,8 @@ struct data_client_t {
 
 struct data_run_open_task_t {
   struct data_fh_t enter_o_arg_fh;
+  u32 enter_o_arg_share_access;
+  u8 enter_o_arg_claim;
   struct data_stateid_t return_o_res_stateid;
 } __attribute__((__packed__));
 
@@ -359,6 +361,10 @@ static int check_enter_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id,
 
   add_data(data, point_id);
   copy_fh(&data->run_open_task.enter_o_arg_fh, opendata->o_arg.fh);
+  bpf_probe_read_kernel(&data->run_open_task.enter_o_arg_share_access, sizeof(u32),
+                        &opendata->o_arg.share_access);
+  bpf_probe_read_kernel(&data->run_open_task.enter_o_arg_claim, sizeof(u8),
+                        &opendata->o_arg.claim);
 
   nfs4_run_open_task_opendata.update(&id, &opendata);
   entryinfo.update(&id, data);
@@ -412,13 +418,9 @@ static int check_enter_nfs4_state_mark_reclaim_nograce(struct pt_regs *ctx, u8 p
   return 0;
 }
 
-static u32 fix_seqid_endianness(char seqid[4]) {
-  u32 ret = 0;
-#pragma unroll
-  for (int i = 0; i < 4; i++) {
-    ret |= seqid[i] << (i * 8);
-  }
-  return ret;
+static u32 fix_seqid_endianness(char seqid[]) {
+  char id[] = {seqid[3], seqid[2], seqid[1], seqid[0]};
+  return *((u32 *)id);
 }
 
 static int check_return_nfs4_run_open_task(struct pt_regs *ctx, u8 point_id) {
